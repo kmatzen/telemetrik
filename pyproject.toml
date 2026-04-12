@@ -5,14 +5,25 @@ build-backend = "hatchling.build"
 [project]
 name = "telemetrik"
 version = "0.1.0"
-description = "Pure-Python parser for GoPro Metadata Format (GPMF). Extract GPS, gyro, accelerometer, orientation, and exposure data from GoPro MP4 files."
+description = "Extract GPS, gyro, accelerometer, and other telemetry from GoPro video files. Pure Python, zero dependencies."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
 authors = [
     { name = "Kevin Blackburn-Matzen" },
 ]
-keywords = ["gopro", "gpmf", "telemetry", "gps", "imu", "gyroscope", "accelerometer", "metadata"]
+keywords = [
+    "gopro",
+    "gpmf",
+    "telemetry",
+    "gps",
+    "imu",
+    "gyroscope",
+    "accelerometer",
+    "action-camera",
+    "metadata",
+    "video",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -34,9 +45,20 @@ classifiers = [
 Homepage = "https://github.com/kmatzen/telemetrik"
 Repository = "https://github.com/kmatzen/telemetrik"
 Issues = "https://github.com/kmatzen/telemetrik/issues"
+Changelog = "https://github.com/kmatzen/telemetrik/blob/main/CHANGELOG.md"
 
 [project.scripts]
 telemetrik = "telemetrik.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/telemetrik"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
