@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpmf-parser"
+version = "0.1.0"
+description = "Pure-Python parser for GoPro Metadata Format (GPMF). Extract GPS, gyro, accelerometer, orientation, and exposure data from GoPro MP4 files."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    { name = "Kevin Blackburn-Matzen" },
+]
+keywords = ["gopro", "gpmf", "telemetry", "gps", "imu", "gyroscope", "accelerometer", "metadata"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/kmatzen/gpmf-parser"
+Repository = "https://github.com/kmatzen/gpmf-parser"
+Issues = "https://github.com/kmatzen/gpmf-parser/issues"
+
+[project.scripts]
+gpmf-extract = "gpmf_parser.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpmf_parser"]
