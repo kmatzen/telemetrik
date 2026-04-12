@@ -1,17 +1,17 @@
-# gpmf-parser
+# telemetrik
 
 Pure-Python parser for [GoPro Metadata Format (GPMF)](https://github.com/gopro/gpmf-parser). Extract GPS, gyroscope, accelerometer, orientation, exposure, and other telemetry from GoPro MP4 files — no compiled dependencies required.
 
 ## Install
 
 ```bash
-pip install gpmf-parser
+pip install telemetrik
 ```
 
 ## Quick start
 
 ```python
-from gpmf_parser import extract_all_telemetry
+from telemetrik import extract_all_telemetry
 
 streams = extract_all_telemetry("GX010042.MP4")
 
@@ -36,13 +36,13 @@ if "CORI" in streams:
 
 ```bash
 # Extract all streams to CSV files alongside the video
-gpmf-extract GX010042.MP4
+telemetrik GX010042.MP4
 
 # Extract specific streams only
-gpmf-extract --streams ACCL,GYRO,GPS5 GX010042.MP4
+telemetrik --streams ACCL,GYRO,GPS5 GX010042.MP4
 
 # Batch extract
-gpmf-extract *.MP4
+telemetrik *.MP4
 ```
 
 Output files are named `<video_stem>.<stream_key>` (e.g., `GX010042.accl`, `GX010042.gps5`).

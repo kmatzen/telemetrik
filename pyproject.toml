@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "gpmf-parser"
+name = "telemetrik"
 version = "0.1.0"
 description = "Pure-Python parser for GoPro Metadata Format (GPMF). Extract GPS, gyro, accelerometer, orientation, and exposure data from GoPro MP4 files."
 readme = "README.md"
@@ -31,12 +31,12 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kmatzen/gpmf-parser"
-Repository = "https://github.com/kmatzen/gpmf-parser"
-Issues = "https://github.com/kmatzen/gpmf-parser/issues"
+Homepage = "https://github.com/kmatzen/telemetrik"
+Repository = "https://github.com/kmatzen/telemetrik"
+Issues = "https://github.com/kmatzen/telemetrik/issues"
 
 [project.scripts]
-gpmf-extract = "gpmf_parser.cli:main"
+telemetrik = "telemetrik.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/gpmf_parser"]
+packages = ["src/telemetrik"]

@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from gpmf_parser import TelemetryStream, extract_all_telemetry
+from telemetrik import TelemetryStream, extract_all_telemetry
 
 
 def save_stream_to_file(stream: TelemetryStream, video_path: Path) -> None:
@@ -34,7 +34,7 @@ def save_stream_to_file(stream: TelemetryStream, video_path: Path) -> None:
 def main() -> None:
     """Extract telemetry from GoPro MP4 files to CSV."""
     parser = argparse.ArgumentParser(
-        prog="gpmf-extract",
+        prog="telemetrik",
         description="Extract GPMF telemetry from GoPro MP4 files",
     )
     parser.add_argument("video_files", nargs="+", type=str, help="GoPro MP4 file(s)")
