@@ -21,7 +21,32 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install package
-        run: pip install -e .
+        run: pip install -e . pytest
 
       - name: Smoke test
         run: python -c "from telemetrik import extract_all_telemetry, TelemetryStream, __version__; print(f'telemetrik {__version__} OK')"
+
+      - name: Test
+        run: python -m pytest
+
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package and tools
+        run: pip install -e . ruff mypy
+
+      - name: Ruff check
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: Mypy
+        run: mypy src/telemetrik

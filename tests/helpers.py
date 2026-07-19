@@ -5,7 +5,8 @@ requiring real GoPro footage as a fixture.
 """
 
 import struct
-from typing import List, Optional, Sequence
+from collections.abc import Sequence
+from typing import Optional
 
 
 def klv(
@@ -136,7 +137,7 @@ def _co64(offsets: Sequence[int]) -> bytes:
 
 
 def build_gopro_mp4(
-    devc_payloads: List[bytes],
+    devc_payloads: list[bytes],
     timescale: int = 1000000,
     mdhd_version: int = 0,
     use_co64: bool = False,
