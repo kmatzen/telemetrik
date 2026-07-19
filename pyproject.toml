@@ -54,7 +54,7 @@ telemetrik = "telemetrik.cli:main"
 packages = ["src/telemetrik"]
 
 [dependency-groups]
-dev = ["pytest"]
+dev = ["pytest", "ruff", "mypy"]
 
 [tool.ruff]
 target-version = "py39"

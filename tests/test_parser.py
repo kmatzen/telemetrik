@@ -75,8 +75,10 @@ def test_single_payload_stream_does_not_crash():
 
 
 def test_single_payload_gps_stream_does_not_crash():
-    body = stmp(1000) + scal([10_000_000, 10_000_000, 1000, 1000, 100]) + gps5_payload(
-        [(377749000, -1224194000, 15300, 500, 510)]
+    body = (
+        stmp(1000)
+        + scal([10_000_000, 10_000_000, 1000, 1000, 100])
+        + gps5_payload([(377749000, -1224194000, 15300, 500, 510)])
     )
     payload = devc(strm(body))
     f = io.BytesIO(payload)
