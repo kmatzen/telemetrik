@@ -12,7 +12,7 @@ import struct
 from dataclasses import dataclass
 from math import ceil
 from os.path import getsize
-from typing import Any, BinaryIO, Dict, List, Optional, Tuple, Union
+from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple, Union
 
 
 def _from_bytes(*args: Any, **kwargs: Any) -> int:
@@ -406,37 +406,32 @@ class TelemetryStream:
 # ---------------------------------------------------------------------------
 
 
-def get_stream_data(
+#: One matched STRM payload: the stream's own box, its parent STRM box, the
+#: SCAL divisor(s) in effect, and the current value of each requested
+#: "sticky" metadata box (e.g. GPS5's GPSF/GPSP), in the order requested.
+_PayloadInfo = Tuple[GPMFBox, GPMFBox, ScaleDivisor, Tuple[int, ...]]
+
+
+def _collect_stream_payloads(
     f: BinaryIO,
     samples: List[Sample],
     stream_key: str,
-    scale: bool = True,
-    time_base: Optional[Tuple[int, int]] = None,
-) -> TelemetryStream:
+    scale: bool,
+    sticky_keys: Tuple[Tuple[str, int], ...] = (),
+) -> Tuple[List[float], List[int], List[_PayloadInfo]]:
     """
-    Extract a single GPMF stream from an MP4 file.
+    Walk each sample's ``DEVC -> STRM`` tree for one matching *stream_key*,
+    collecting its STMP timestamp and SCAL divisor(s).
 
-    Args:
-        f: Binary file stream opened with ``"rb"``.
-        samples: Sample table from :func:`get_samples`.
-        stream_key: GPMF FourCC (e.g. ``"ACCL"``, ``"GYRO"``, ``"SHUT"``).
-        scale: Apply the SCAL divisor to raw values.
-        time_base: ``(numerator, denominator)`` for converting PTS to seconds.
-
-    Returns:
-        A :class:`TelemetryStream` with STMP-based and optional PTS-based
-        timestamps.
+    *sticky_keys* is a list of ``(fourcc, default)`` pairs for metadata boxes
+    that persist across samples once first seen (GPS5's GPSF/GPSP); their
+    current values are carried forward from the closest earlier sample that
+    had them.
     """
-    data = []
-    pts_data = []
-    sample_count = 0
-    name = ""
-    units = ""
-
-    # First pass: collect timestamps and payload metadata
     stmp_timestamps = []
     sample_pts_list = []
     payload_info = []
+    sticky_values = dict(sticky_keys)
 
     for sample in samples:
         strm = None
@@ -468,20 +463,54 @@ def get_stream_data(
                         for _ in range(scal.repeat)
                     )
 
+        for key, _default in sticky_keys:
+            key_boxes = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", key])
+            if key_boxes:
+                key_box = key_boxes[0]
+                f.seek(key_box.offset + 8)
+                sticky_values[key] = _from_bytes(f.read(key_box.struct_size))
+
         stream_box = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", stream_key])[0]
 
         stmp_timestamps.append(stmp_ms)
         sample_pts_list.append(sample.pts if sample.pts is not None else 0)
-        payload_info.append((stream_box, strm, scale_divisor))
+        payload_info.append(
+            (stream_box, strm, scale_divisor, tuple(sticky_values[key] for key, _ in sticky_keys))
+        )
 
-    # Second pass: decode values with interpolated timestamps.
-    # Falls back to the previous payload's duration for the final payload (no
-    # "next" timestamp to interpolate against), and to 0.0 when there is only
-    # ever a single payload.
+    return stmp_timestamps, sample_pts_list, payload_info
+
+
+def _decode_stream_values(
+    f: BinaryIO,
+    payload_info: List[_PayloadInfo],
+    stmp_timestamps: List[float],
+    sample_pts_list: List[int],
+    time_base: Optional[Tuple[int, int]],
+    transform: Optional[Callable[[Any, Tuple[int, ...]], Optional[Any]]] = None,
+) -> Tuple[List[Tuple[int, Any]], List[Tuple[float, Any]], int, str, str]:
+    """
+    Decode each payload's raw values with interpolated STMP/PTS timestamps,
+    collecting the stream's name (STNM) and units (SIUN) along the way.
+
+    *transform* post-processes each raw decoded value together with that
+    payload's sticky metadata tuple; returning ``None`` skips the reading
+    (used by GPS5 to discard incomplete tuples).
+
+    Falls back to the previous payload's duration for the final payload (no
+    "next" timestamp to interpolate against), and to 0.0 when there is only
+    ever a single payload.
+    """
+    data = []
+    pts_data = []
+    sample_count = 0
+    name = ""
+    units = ""
+
     reading_duration_ms = 0.0
     reading_duration_pts = 0.0
 
-    for payload_idx, (stream_box, strm, scale_divisor) in enumerate(payload_info):
+    for payload_idx, (stream_box, strm, scale_divisor, sticky) in enumerate(payload_info):
         f.seek(stream_box.offset + 8)
 
         base_timestamp_ms = stmp_timestamps[payload_idx]
@@ -500,7 +529,10 @@ def get_stream_data(
         for i in range(stream_box.repeat):
             timestamp_ms = base_timestamp_ms + (i * reading_duration_ms)
 
-            value = _parse_gpmf_value(f, stream_box.type, stream_box.struct_size, scale_divisor)
+            raw_value = _parse_gpmf_value(f, stream_box.type, stream_box.struct_size, scale_divisor)
+            value = transform(raw_value, sticky) if transform is not None else raw_value
+            if value is None:
+                continue
             data.append((int(timestamp_ms), value))
 
             if time_base is not None:
@@ -540,6 +572,37 @@ def get_stream_data(
                     else:
                         units += unit_char.decode("ascii")
 
+    return data, pts_data, sample_count, name, units
+
+
+def get_stream_data(
+    f: BinaryIO,
+    samples: List[Sample],
+    stream_key: str,
+    scale: bool = True,
+    time_base: Optional[Tuple[int, int]] = None,
+) -> TelemetryStream:
+    """
+    Extract a single GPMF stream from an MP4 file.
+
+    Args:
+        f: Binary file stream opened with ``"rb"``.
+        samples: Sample table from :func:`get_samples`.
+        stream_key: GPMF FourCC (e.g. ``"ACCL"``, ``"GYRO"``, ``"SHUT"``).
+        scale: Apply the SCAL divisor to raw values.
+        time_base: ``(numerator, denominator)`` for converting PTS to seconds.
+
+    Returns:
+        A :class:`TelemetryStream` with STMP-based and optional PTS-based
+        timestamps.
+    """
+    stmp_timestamps, sample_pts_list, payload_info = _collect_stream_payloads(
+        f, samples, stream_key, scale
+    )
+    data, pts_data, sample_count, name, units = _decode_stream_values(
+        f, payload_info, stmp_timestamps, sample_pts_list, time_base
+    )
+
     return TelemetryStream(
         stream_key, sample_count, name, units, data, pts_data=pts_data if pts_data else None
     )
@@ -549,121 +612,23 @@ def _get_gps_data_with_sticky_metadata(
     f: BinaryIO, samples: List[Sample], time_base: Optional[Tuple[int, int]] = None
 ) -> TelemetryStream:
     """Extract GPS5 with sticky GPSF (fix type) and GPSP (precision) metadata."""
-    data = []
-    pts_data = []
-    sample_count = 0
-    name = ""
-    units = ""
+    stmp_timestamps, sample_pts_list, payload_info = _collect_stream_payloads(
+        f, samples, "GPS5", scale=True, sticky_keys=(("GPSF", 0), ("GPSP", 9999))
+    )
 
-    current_gps_fix = 0
-    current_gps_precision = 9999
+    def _extend_with_gps_quality(raw_value: Any, sticky: Tuple[int, ...]) -> Optional[Any]:
+        if isinstance(raw_value, tuple) and len(raw_value) == 5:
+            return raw_value + sticky
+        return None
 
-    stmp_timestamps = []
-    sample_pts_list = []
-    payload_info = []
-
-    for sample in samples:
-        strm = None
-        strm_boxes = get_gpmf_boxes(f, sample.offset, sample.size, ["DEVC", "STRM"])
-        for box in strm_boxes:
-            if get_gpmf_boxes(f, box.offset, box.size, ["STRM", "GPS5"]):
-                strm = box
-                break
-        if strm is None:
-            continue
-
-        stmp_boxes = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", "STMP"])
-        if not stmp_boxes:
-            continue
-        stmp = stmp_boxes[0]
-        f.seek(stmp.offset + 8)
-        stmp_us = _from_bytes(f.read(stmp.struct_size * stmp.repeat))
-        stmp_ms = stmp_us / 1000
-
-        scale_divisor: ScaleDivisor = 1.0
-        scal_boxes = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", "SCAL"])
-        if scal_boxes:
-            scal = scal_boxes[0]
-            f.seek(scal.offset + 8)
-            if scal.struct_size in (2, 4):
-                scale_divisor = tuple(
-                    _from_bytes(f.read(scal.struct_size), signed=True) for _ in range(scal.repeat)
-                )
-
-        gpsf_boxes = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", "GPSF"])
-        if gpsf_boxes:
-            gpsf = gpsf_boxes[0]
-            f.seek(gpsf.offset + 8)
-            current_gps_fix = _from_bytes(f.read(gpsf.struct_size))
-
-        gpsp_boxes = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", "GPSP"])
-        if gpsp_boxes:
-            gpsp = gpsp_boxes[0]
-            f.seek(gpsp.offset + 8)
-            current_gps_precision = _from_bytes(f.read(gpsp.struct_size))
-
-        stream_box = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", "GPS5"])[0]
-
-        stmp_timestamps.append(stmp_ms)
-        sample_pts_list.append(sample.pts if sample.pts is not None else 0)
-        payload_info.append(
-            (stream_box, strm, scale_divisor, current_gps_fix, current_gps_precision)
-        )
-
-    # Falls back to the previous payload's duration for the final payload (no
-    # "next" timestamp to interpolate against), and to 0.0 when there is only
-    # ever a single payload.
-    reading_duration_ms = 0.0
-    reading_duration_pts = 0.0
-
-    for payload_idx, (stream_box, strm, scale_divisor, gps_fix, gps_precision) in enumerate(
-        payload_info
-    ):
-        f.seek(stream_box.offset + 8)
-
-        base_timestamp_ms = stmp_timestamps[payload_idx]
-        base_pts = sample_pts_list[payload_idx]
-
-        if payload_idx + 1 < len(stmp_timestamps):
-            next_stmp_ms = stmp_timestamps[payload_idx + 1]
-            delta_stmp_ms = next_stmp_ms - base_timestamp_ms
-            reading_duration_ms = delta_stmp_ms / stream_box.repeat
-
-            if time_base is not None:
-                next_pts = sample_pts_list[payload_idx + 1]
-                delta_pts = next_pts - base_pts
-                reading_duration_pts = delta_pts / stream_box.repeat
-
-        for i in range(stream_box.repeat):
-            timestamp_ms = base_timestamp_ms + (i * reading_duration_ms)
-
-            gps5_tuple = _parse_gpmf_value(
-                f, stream_box.type, stream_box.struct_size, scale_divisor
-            )
-
-            if isinstance(gps5_tuple, tuple) and len(gps5_tuple) == 5:
-                extended_value = gps5_tuple + (gps_fix, gps_precision)
-                data.append((int(timestamp_ms), extended_value))
-
-                if time_base is not None:
-                    pts_value = base_pts + (i * reading_duration_pts)
-                    pts_seconds = pts_value * time_base[0] / time_base[1]
-                    pts_data.append((pts_seconds, extended_value))
-
-                sample_count += 1
-
-        if name == "":
-            stnm_boxes = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", "STNM"])
-            if stnm_boxes:
-                stnm = stnm_boxes[0]
-                f.seek(stnm.offset + 8)
-                name = f.read(stnm.struct_size * stnm.repeat).decode("ascii").rstrip("\x00")
-
-            siun_boxes = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", "SIUN"])
-            if siun_boxes:
-                siun = siun_boxes[0]
-                f.seek(siun.offset + 8)
-                units = f.read(siun.struct_size * siun.repeat).decode("ascii").rstrip("\x00")
+    data, pts_data, sample_count, name, units = _decode_stream_values(
+        f,
+        payload_info,
+        stmp_timestamps,
+        sample_pts_list,
+        time_base,
+        transform=_extend_with_gps_quality,
+    )
 
     return TelemetryStream(
         key="GPS5",
