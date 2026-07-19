@@ -20,7 +20,9 @@ from .helpers import (
     gpsf,
     gpsp,
     scal,
+    siun,
     stmp,
+    stnm,
     strm,
 )
 
@@ -149,3 +151,55 @@ def test_extract_all_telemetry_end_to_end():
     _, (lat, lon, alt, speed_2d, speed_3d, fix, dop) = telemetry["GPS5"].data[0]
     assert lat == 37.7749
     assert alt == 15.3
+
+
+def test_multiple_streams_in_one_devc_are_extracted_independently():
+    """Two distinct STRM boxes (ACCL, GPS5) inside the same DEVC must not
+    cross-contaminate each other's timestamps, SCAL divisors, or values."""
+    accl_strm = strm(stmp(0) + accl_payload([(100, 200, 300)]))
+    gps_strm = strm(
+        stmp(0)
+        + scal([10_000_000, 10_000_000, 1000, 1000, 100])
+        + gps5_payload([(377749000, -1224194000, 15300, 500, 510)])
+    )
+    payload = devc(accl_strm + gps_strm)
+    mp4_bytes = build_gopro_mp4([payload])
+
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        video_path = Path(tmpdir) / "test.mp4"
+        video_path.write_bytes(mp4_bytes)
+        telemetry = extract_all_telemetry(str(video_path), streams=["ACCL", "GPS5"])
+
+    assert telemetry["ACCL"].data[0][1] == (100.0, 200.0, 300.0)
+    _, (lat, lon, alt, *_rest) = telemetry["GPS5"].data[0]
+    assert lat == 37.7749
+    assert alt == 15.3
+
+
+def test_gps5_units_are_retried_independently_of_name():
+    """name and units are captured from whichever payload has them first,
+    independently of each other (not "give up on units once name is found")."""
+    body1 = (
+        stmp(0)
+        + stnm("GPS (Latitude, Longitude, Altitude)")
+        + scal([10_000_000, 10_000_000, 1000, 1000, 100])
+        + gps5_payload([(377749000, -1224194000, 15300, 500, 510)])
+    )
+    body2 = (
+        stmp(1_000_000)
+        + siun("m,m,m,m/s,m/s")
+        + scal([10_000_000, 10_000_000, 1000, 1000, 100])
+        + gps5_payload([(377750000, -1224195000, 15400, 510, 520)])
+    )
+    payload1 = devc(strm(body1))
+    payload2 = devc(strm(body2))
+    f = io.BytesIO(payload1 + payload2)
+    samples = [Sample(0, len(payload1)), Sample(len(payload1), len(payload2))]
+
+    stream = _get_gps_data_with_sticky_metadata(f, samples)
+
+    assert stream.name == "GPS (Latitude, Longitude, Altitude)"
+    assert stream.units == "m,m,m,m/s,m/s,fix,dop"
