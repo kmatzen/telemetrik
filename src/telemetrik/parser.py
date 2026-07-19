@@ -8,6 +8,7 @@ Extended with PTS/DTS timestamps, GPS sticky metadata, unified extraction
 API, and additional stream support.
 """
 
+import struct
 from dataclasses import dataclass
 from math import ceil
 from os.path import getsize
@@ -243,30 +244,77 @@ def _parse_gpmf_value(
 
     # Float (32-bit)
     elif type_char == "f":
-        import struct
-
         if struct_size == 4:
             return struct.unpack(">f", f.read(4))[0]
         else:
             return tuple(struct.unpack(">f", f.read(4))[0] for _ in range(struct_size // 4))
 
+    # Double (64-bit float)
+    elif type_char == "d":
+        if struct_size == 8:
+            return struct.unpack(">d", f.read(8))[0]
+        else:
+            return tuple(struct.unpack(">d", f.read(8))[0] for _ in range(struct_size // 8))
+
+    # Signed 64-bit integer
+    elif type_char == "j":
+        if struct_size == 8:
+            return _from_bytes(f.read(8), signed=True) / _divisor_at(scale_divisor, 0)
+        else:
+            return tuple(
+                _from_bytes(f.read(8), signed=True) / _divisor_at(scale_divisor, i)
+                for i in range(struct_size // 8)
+            )
+
+    # Unsigned 64-bit integer
+    elif type_char == "J":
+        if struct_size == 8:
+            return _from_bytes(f.read(8)) / _divisor_at(scale_divisor, 0)
+        else:
+            return tuple(
+                _from_bytes(f.read(8)) / _divisor_at(scale_divisor, i)
+                for i in range(struct_size // 8)
+            )
+
     # Signed byte
     elif type_char == "b":
-        return _from_bytes(f.read(struct_size), signed=True) / _divisor_at(scale_divisor, 0)
+        if struct_size == 1:
+            return _from_bytes(f.read(1), signed=True) / _divisor_at(scale_divisor, 0)
+        else:
+            return tuple(
+                _from_bytes(f.read(1), signed=True) / _divisor_at(scale_divisor, i)
+                for i in range(struct_size)
+            )
 
     # Unsigned byte
     elif type_char == "B":
-        return _from_bytes(f.read(struct_size)) / _divisor_at(scale_divisor, 0)
+        if struct_size == 1:
+            return _from_bytes(f.read(1)) / _divisor_at(scale_divisor, 0)
+        else:
+            return tuple(
+                _from_bytes(f.read(1)) / _divisor_at(scale_divisor, i) for i in range(struct_size)
+            )
 
     # String/character
     elif type_char == "c":
         return f.read(struct_size).decode("ascii").rstrip("\x00")
 
-    # Quaternion (4 floats)
-    elif type_char == "q":
-        import struct
+    # FourCC code
+    elif type_char == "F":
+        return f.read(struct_size).decode("ascii")
 
-        return tuple(struct.unpack(">f", f.read(4))[0] for _ in range(4))
+    # UTC date/time string ("YYMMDDhhmmss.sss")
+    elif type_char == "U":
+        return f.read(struct_size).decode("ascii").rstrip("\x00")
+
+    # Q15.16 fixed-point number
+    elif type_char == "q":
+        if struct_size == 4:
+            return _from_bytes(f.read(4), signed=True) / 65536.0
+        else:
+            return tuple(
+                _from_bytes(f.read(4), signed=True) / 65536.0 for _ in range(struct_size // 4)
+            )
 
     # Default: raw bytes
     else:
