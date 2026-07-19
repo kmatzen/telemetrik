@@ -40,20 +40,47 @@ def get_boxes(f: BinaryIO, offset: int, size: int, box_path: List[str]) -> List[
     Walk the MP4 box hierarchy along *box_path* and return matching boxes.
 
     Example *box_path*: ``["moov", "trak", "mdia", "minf", "stbl"]``
+
+    Raises:
+        ValueError: If a box header is truncated, has a key that isn't valid
+            ASCII, or has a size too small to contain its own header.
     """
     boxes = []
     end = offset + size
     f.seek(offset)
     while offset < end:
         header = f.read(8)
-        size = _from_bytes(header[0:4])
-        key = header[4:8].decode("ascii")
+        if len(header) < 8:
+            raise ValueError(f"Truncated MP4 box header at offset {offset}.")
+        raw_size = _from_bytes(header[0:4])
+        try:
+            key = header[4:8].decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Invalid MP4 box key at offset {offset}.") from exc
+
+        header_len = 8
+        if raw_size == 1:
+            # size == 1 means the real (64-bit) size follows as "largesize".
+            largesize_bytes = f.read(8)
+            if len(largesize_bytes) < 8:
+                raise ValueError(f"Truncated MP4 box largesize at offset {offset}.")
+            box_size = _from_bytes(largesize_bytes)
+            header_len = 16
+        elif raw_size == 0:
+            # size == 0 means "extends to the end of the file/parent box".
+            box_size = end - offset
+        else:
+            box_size = raw_size
+
+        if box_size < header_len:
+            raise ValueError(f"Invalid MP4 box size {box_size} at offset {offset}.")
+
         if key == box_path[0]:
             if len(box_path) == 1:
-                boxes += [Box(key, offset, size)]
+                boxes += [Box(key, offset, box_size)]
             else:
-                boxes += get_boxes(f, offset + 8, size - 8, box_path[1:])
-        offset += size
+                boxes += get_boxes(f, offset + header_len, box_size - header_len, box_path[1:])
+        offset += box_size
         f.seek(offset)
     return boxes
 
@@ -87,13 +114,25 @@ def get_samples(f: BinaryIO, stbl: Box) -> List[Sample]:
         for _ in range(num_entries):
             sample_sizes.append(_from_bytes(f.read(4)))
 
-    # Sample offsets (stco)
+    # Sample offsets: 32-bit (stco), or 64-bit (co64) for files with sample data
+    # beyond the 4 GB mark.
     sample_offsets = []
-    stco = get_boxes(f, stbl.offset, stbl.size, box_path=["stbl", "stco"])[0]
-    f.seek(stco.offset + 12)
-    num_entries = _from_bytes(f.read(4))
-    for _ in range(num_entries):
-        sample_offsets.append(_from_bytes(f.read(4)))
+    stco_boxes = get_boxes(f, stbl.offset, stbl.size, box_path=["stbl", "stco"])
+    co64_boxes = get_boxes(f, stbl.offset, stbl.size, box_path=["stbl", "co64"])
+    if stco_boxes:
+        stco = stco_boxes[0]
+        f.seek(stco.offset + 12)
+        num_entries = _from_bytes(f.read(4))
+        for _ in range(num_entries):
+            sample_offsets.append(_from_bytes(f.read(4)))
+    elif co64_boxes:
+        co64 = co64_boxes[0]
+        f.seek(co64.offset + 12)
+        num_entries = _from_bytes(f.read(4))
+        for _ in range(num_entries):
+            sample_offsets.append(_from_bytes(f.read(8)))
+    else:
+        raise ValueError("Sample table has no chunk offset box (stco/co64).")
 
     # Sample durations (stts) → used to compute DTS
     sample_durations = []
@@ -158,17 +197,31 @@ class GPMFBox:
 
 
 def get_gpmf_boxes(f: BinaryIO, offset: int, size: int, box_path: List[str]) -> List[GPMFBox]:
-    """Walk the GPMF KLV hierarchy and return matching elements."""
+    """
+    Walk the GPMF KLV hierarchy and return matching elements.
+
+    Raises:
+        ValueError: If a KLV header is truncated or has a key/type that isn't
+            valid ASCII.
+    """
     boxes = []
     end = offset + size
     f.seek(offset)
     while offset < end:
         header = f.read(8)
-        key = header[0:4].decode("ascii")
+        if len(header) < 8:
+            raise ValueError(f"Truncated GPMF KLV header at offset {offset}.")
+        try:
+            key = header[0:4].decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Invalid GPMF KLV key at offset {offset}.") from exc
         if _from_bytes(header[4:5]) == 0:
             type = None
         else:
-            type = header[4:5].decode("ascii")
+            try:
+                type = header[4:5].decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"Invalid GPMF KLV type at offset {offset}.") from exc
         struct_size = _from_bytes(header[5:6])
         repeat = _from_bytes(header[6:8])
         # 32-bit aligned
@@ -688,8 +741,13 @@ def extract_all_telemetry(
             mdhd_boxes = get_boxes(f, gpmf_mdia.offset, gpmf_mdia.size, ["mdia", "mdhd"])
             if mdhd_boxes:
                 mdhd = mdhd_boxes[0]
+                f.seek(mdhd.offset + 8)
+                version = _from_bytes(f.read(1))
                 f.seek(mdhd.offset + 12)
-                f.read(8)  # skip creation_time + modification_time
+                if version == 1:
+                    f.read(16)  # skip creation_time + modification_time (64-bit each)
+                else:
+                    f.read(8)  # skip creation_time + modification_time (32-bit each)
                 timescale = _from_bytes(f.read(4))
                 time_base = (1, timescale)
 
