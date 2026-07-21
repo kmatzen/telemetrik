@@ -21,7 +21,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install package
-        run: pip install -e .
+        run: pip install -e ".[dev]"
 
       - name: Smoke test
         run: python -c "from telemetrik import extract_all_telemetry, TelemetryStream, __version__; print(f'telemetrik {__version__} OK')"
+
+      - name: Run tests
+        run: pytest --cov=telemetrik --cov-report=term-missing
