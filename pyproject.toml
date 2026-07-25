@@ -57,7 +57,7 @@ packages = ["src/telemetrik"]
 path = "src/telemetrik/__init__.py"
 
 [dependency-groups]
-dev = ["pytest"]
+dev = ["pytest", "ruff", "mypy"]
 
 [tool.ruff]
 target-version = "py39"
