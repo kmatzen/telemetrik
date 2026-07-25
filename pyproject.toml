@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "telemetrik"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Extract GPS, gyro, accelerometer, and other telemetry from GoPro video files. Pure Python, zero dependencies."
 readme = "README.md"
 license = "MIT"
@@ -52,6 +52,9 @@ telemetrik = "telemetrik.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/telemetrik"]
+
+[tool.hatch.version]
+path = "src/telemetrik/__init__.py"
 
 [dependency-groups]
 dev = ["pytest"]
