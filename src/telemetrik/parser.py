@@ -12,7 +12,7 @@ import struct
 from dataclasses import dataclass
 from math import ceil
 from os.path import getsize
-from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, BinaryIO, Callable, Optional, Union
 
 
 def _from_bytes(*args: Any, **kwargs: Any) -> int:
@@ -35,7 +35,7 @@ class Box:
     size: int
 
 
-def get_boxes(f: BinaryIO, offset: int, size: int, box_path: List[str]) -> List[Box]:
+def get_boxes(f: BinaryIO, offset: int, size: int, box_path: list[str]) -> list[Box]:
     """
     Walk the MP4 box hierarchy along *box_path* and return matching boxes.
 
@@ -100,7 +100,7 @@ class Sample:
     dts: Optional[int] = None
 
 
-def get_samples(f: BinaryIO, stbl: Box) -> List[Sample]:
+def get_samples(f: BinaryIO, stbl: Box) -> list[Sample]:
     """Parse the sample table (stbl) and return :class:`Sample` objects with PTS/DTS."""
     # Sample sizes (stsz)
     sample_sizes = []
@@ -196,7 +196,7 @@ class GPMFBox:
     repeat: int
 
 
-def get_gpmf_boxes(f: BinaryIO, offset: int, size: int, box_path: List[str]) -> List[GPMFBox]:
+def get_gpmf_boxes(f: BinaryIO, offset: int, size: int, box_path: list[str]) -> list[GPMFBox]:
     """
     Walk the GPMF KLV hierarchy and return matching elements.
 
@@ -238,7 +238,7 @@ def get_gpmf_boxes(f: BinaryIO, offset: int, size: int, box_path: List[str]) -> 
 
 #: Either a single divisor applied to every channel, or one divisor per channel
 #: (as GPMF SCAL provides for e.g. GPS5's 5 distinct units).
-ScaleDivisor = Union[float, Tuple[float, ...]]
+ScaleDivisor = Union[float, tuple[float, ...]]
 
 
 def _divisor_at(scale_divisor: ScaleDivisor, index: int) -> float:
@@ -397,8 +397,8 @@ class TelemetryStream:
     sample_count: int
     name: str
     units: str
-    data: List[Tuple[int, Any]]
-    pts_data: Optional[List[Tuple[float, Any]]] = None
+    data: list[tuple[int, Any]]
+    pts_data: Optional[list[tuple[float, Any]]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -409,16 +409,16 @@ class TelemetryStream:
 #: One matched STRM payload: the stream's own box, its parent STRM box, the
 #: SCAL divisor(s) in effect, and the current value of each requested
 #: "sticky" metadata box (e.g. GPS5's GPSF/GPSP), in the order requested.
-_PayloadInfo = Tuple[GPMFBox, GPMFBox, ScaleDivisor, Tuple[int, ...]]
+_PayloadInfo = tuple[GPMFBox, GPMFBox, ScaleDivisor, tuple[int, ...]]
 
 
 def _collect_stream_payloads(
     f: BinaryIO,
-    samples: List[Sample],
+    samples: list[Sample],
     stream_key: str,
     scale: bool,
-    sticky_keys: Tuple[Tuple[str, int], ...] = (),
-) -> Tuple[List[float], List[int], List[_PayloadInfo]]:
+    sticky_keys: tuple[tuple[str, int], ...] = (),
+) -> tuple[list[float], list[int], list[_PayloadInfo]]:
     """
     Walk each sample's ``DEVC -> STRM`` tree for one matching *stream_key*,
     collecting its STMP timestamp and SCAL divisor(s).
@@ -483,12 +483,12 @@ def _collect_stream_payloads(
 
 def _decode_stream_values(
     f: BinaryIO,
-    payload_info: List[_PayloadInfo],
-    stmp_timestamps: List[float],
-    sample_pts_list: List[int],
-    time_base: Optional[Tuple[int, int]],
-    transform: Optional[Callable[[Any, Tuple[int, ...]], Optional[Any]]] = None,
-) -> Tuple[List[Tuple[int, Any]], List[Tuple[float, Any]], int, str, str]:
+    payload_info: list[_PayloadInfo],
+    stmp_timestamps: list[float],
+    sample_pts_list: list[int],
+    time_base: Optional[tuple[int, int]],
+    transform: Optional[Callable[[Any, tuple[int, ...]], Optional[Any]]] = None,
+) -> tuple[list[tuple[int, Any]], list[tuple[float, Any]], int, str, str]:
     """
     Decode each payload's raw values with interpolated STMP/PTS timestamps,
     collecting the stream's name (STNM) and units (SIUN) along the way.
@@ -577,10 +577,10 @@ def _decode_stream_values(
 
 def get_stream_data(
     f: BinaryIO,
-    samples: List[Sample],
+    samples: list[Sample],
     stream_key: str,
     scale: bool = True,
-    time_base: Optional[Tuple[int, int]] = None,
+    time_base: Optional[tuple[int, int]] = None,
 ) -> TelemetryStream:
     """
     Extract a single GPMF stream from an MP4 file.
@@ -609,14 +609,14 @@ def get_stream_data(
 
 
 def _get_gps_data_with_sticky_metadata(
-    f: BinaryIO, samples: List[Sample], time_base: Optional[Tuple[int, int]] = None
+    f: BinaryIO, samples: list[Sample], time_base: Optional[tuple[int, int]] = None
 ) -> TelemetryStream:
     """Extract GPS5 with sticky GPSF (fix type) and GPSP (precision) metadata."""
     stmp_timestamps, sample_pts_list, payload_info = _collect_stream_payloads(
         f, samples, "GPS5", scale=True, sticky_keys=(("GPSF", 0), ("GPSP", 9999))
     )
 
-    def _extend_with_gps_quality(raw_value: Any, sticky: Tuple[int, ...]) -> Optional[Any]:
+    def _extend_with_gps_quality(raw_value: Any, sticky: tuple[int, ...]) -> Optional[Any]:
         if isinstance(raw_value, tuple) and len(raw_value) == 5:
             return raw_value + sticky
         return None
@@ -661,8 +661,8 @@ DEFAULT_STREAMS = [
 
 def extract_all_telemetry(
     video_path: str,
-    streams: Optional[List[str]] = None,
-) -> Dict[str, TelemetryStream]:
+    streams: Optional[list[str]] = None,
+) -> dict[str, TelemetryStream]:
     """
     Extract telemetry streams from a GoPro MP4 file.
 
