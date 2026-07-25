@@ -11,7 +11,7 @@ API, and additional stream support.
 from dataclasses import dataclass
 from math import ceil
 from os.path import getsize
-from typing import Any, BinaryIO, Dict, List, Optional, Tuple
+from typing import Any, BinaryIO, Dict, List, Optional, Tuple, Union
 
 
 def _from_bytes(*args: Any, **kwargs: Any) -> int:
@@ -182,7 +182,21 @@ def get_gpmf_boxes(f: BinaryIO, offset: int, size: int, box_path: List[str]) -> 
     return boxes
 
 
-def _parse_gpmf_value(f: BinaryIO, type_char: str, struct_size: int, scale_divisor: float) -> Any:
+#: Either a single divisor applied to every channel, or one divisor per channel
+#: (as GPMF SCAL provides for e.g. GPS5's 5 distinct units).
+ScaleDivisor = Union[float, Tuple[float, ...]]
+
+
+def _divisor_at(scale_divisor: ScaleDivisor, index: int) -> float:
+    """Look up the divisor for channel *index*, broadcasting a scalar/single-value SCAL."""
+    if isinstance(scale_divisor, tuple):
+        return scale_divisor[index] if len(scale_divisor) > 1 else scale_divisor[0]
+    return scale_divisor
+
+
+def _parse_gpmf_value(
+    f: BinaryIO, type_char: Optional[str], struct_size: int, scale_divisor: ScaleDivisor
+) -> Any:
     """Parse a single GPMF value based on its type character."""
     if type_char is None:
         return None
@@ -190,36 +204,42 @@ def _parse_gpmf_value(f: BinaryIO, type_char: str, struct_size: int, scale_divis
     # Signed 16-bit integer
     if type_char == "s":
         if struct_size == 2:
-            return _from_bytes(f.read(2), signed=True) / scale_divisor
+            return _from_bytes(f.read(2), signed=True) / _divisor_at(scale_divisor, 0)
         else:
             return tuple(
-                _from_bytes(f.read(2), signed=True) / scale_divisor
-                for _ in range(struct_size // 2)
+                _from_bytes(f.read(2), signed=True) / _divisor_at(scale_divisor, i)
+                for i in range(struct_size // 2)
             )
 
     # Signed 32-bit integer
     elif type_char == "l":
         if struct_size == 4:
-            return _from_bytes(f.read(4), signed=True) / scale_divisor
+            return _from_bytes(f.read(4), signed=True) / _divisor_at(scale_divisor, 0)
         else:
             return tuple(
-                _from_bytes(f.read(4), signed=True) / scale_divisor
-                for _ in range(struct_size // 4)
+                _from_bytes(f.read(4), signed=True) / _divisor_at(scale_divisor, i)
+                for i in range(struct_size // 4)
             )
 
     # Unsigned 16-bit integer
     elif type_char == "S":
         if struct_size == 2:
-            return _from_bytes(f.read(2)) / scale_divisor
+            return _from_bytes(f.read(2)) / _divisor_at(scale_divisor, 0)
         else:
-            return tuple(_from_bytes(f.read(2)) / scale_divisor for _ in range(struct_size // 2))
+            return tuple(
+                _from_bytes(f.read(2)) / _divisor_at(scale_divisor, i)
+                for i in range(struct_size // 2)
+            )
 
     # Unsigned 32-bit integer
     elif type_char == "L":
         if struct_size == 4:
-            return _from_bytes(f.read(4)) / scale_divisor
+            return _from_bytes(f.read(4)) / _divisor_at(scale_divisor, 0)
         else:
-            return tuple(_from_bytes(f.read(4)) / scale_divisor for _ in range(struct_size // 4))
+            return tuple(
+                _from_bytes(f.read(4)) / _divisor_at(scale_divisor, i)
+                for i in range(struct_size // 4)
+            )
 
     # Float (32-bit)
     elif type_char == "f":
@@ -232,11 +252,11 @@ def _parse_gpmf_value(f: BinaryIO, type_char: str, struct_size: int, scale_divis
 
     # Signed byte
     elif type_char == "b":
-        return _from_bytes(f.read(struct_size), signed=True) / scale_divisor
+        return _from_bytes(f.read(struct_size), signed=True) / _divisor_at(scale_divisor, 0)
 
     # Unsigned byte
     elif type_char == "B":
-        return _from_bytes(f.read(struct_size)) / scale_divisor
+        return _from_bytes(f.read(struct_size)) / _divisor_at(scale_divisor, 0)
 
     # String/character
     elif type_char == "c":
@@ -335,16 +355,17 @@ def get_stream_data(
         stmp_us = _from_bytes(f.read(stmp.struct_size * stmp.repeat))
         stmp_ms = stmp_us / 1000
 
-        scale_divisor = 1
+        scale_divisor: ScaleDivisor = 1.0
         if scale:
             scal_boxes = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", "SCAL"])
             if scal_boxes:
                 scal = scal_boxes[0]
                 f.seek(scal.offset + 8)
-                if scal.struct_size == 2:
-                    scale_divisor = _from_bytes(f.read(2), signed=True)
-                elif scal.struct_size == 4:
-                    scale_divisor = _from_bytes(f.read(4), signed=True)
+                if scal.struct_size in (2, 4):
+                    scale_divisor = tuple(
+                        _from_bytes(f.read(scal.struct_size), signed=True)
+                        for _ in range(scal.repeat)
+                    )
 
         stream_box = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", stream_key])[0]
 
@@ -352,9 +373,12 @@ def get_stream_data(
         sample_pts_list.append(sample.pts if sample.pts is not None else 0)
         payload_info.append((stream_box, strm, scale_divisor))
 
-    # Second pass: decode values with interpolated timestamps
-    reading_duration_ms = None
-    reading_duration_pts = None
+    # Second pass: decode values with interpolated timestamps.
+    # Falls back to the previous payload's duration for the final payload (no
+    # "next" timestamp to interpolate against), and to 0.0 when there is only
+    # ever a single payload.
+    reading_duration_ms = 0.0
+    reading_duration_pts = 0.0
 
     for payload_idx, (stream_box, strm, scale_divisor) in enumerate(payload_info):
         f.seek(stream_box.offset + 8)
@@ -378,7 +402,7 @@ def get_stream_data(
             value = _parse_gpmf_value(f, stream_box.type, stream_box.struct_size, scale_divisor)
             data.append((int(timestamp_ms), value))
 
-            if time_base is not None and reading_duration_pts is not None:
+            if time_base is not None:
                 pts_value = base_pts + (i * reading_duration_pts)
                 pts_seconds = pts_value * time_base[0] / time_base[1]
                 pts_data.append((pts_seconds, value))
@@ -455,15 +479,15 @@ def _get_gps_data_with_sticky_metadata(
         stmp_us = _from_bytes(f.read(stmp.struct_size * stmp.repeat))
         stmp_ms = stmp_us / 1000
 
-        scale_divisor = 1
+        scale_divisor: ScaleDivisor = 1.0
         scal_boxes = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", "SCAL"])
         if scal_boxes:
             scal = scal_boxes[0]
             f.seek(scal.offset + 8)
-            if scal.struct_size == 2:
-                scale_divisor = _from_bytes(f.read(2), signed=True)
-            elif scal.struct_size == 4:
-                scale_divisor = _from_bytes(f.read(4), signed=True)
+            if scal.struct_size in (2, 4):
+                scale_divisor = tuple(
+                    _from_bytes(f.read(scal.struct_size), signed=True) for _ in range(scal.repeat)
+                )
 
         gpsf_boxes = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", "GPSF"])
         if gpsf_boxes:
@@ -485,8 +509,11 @@ def _get_gps_data_with_sticky_metadata(
             (stream_box, strm, scale_divisor, current_gps_fix, current_gps_precision)
         )
 
-    reading_duration_ms = None
-    reading_duration_pts = None
+    # Falls back to the previous payload's duration for the final payload (no
+    # "next" timestamp to interpolate against), and to 0.0 when there is only
+    # ever a single payload.
+    reading_duration_ms = 0.0
+    reading_duration_pts = 0.0
 
     for payload_idx, (stream_box, strm, scale_divisor, gps_fix, gps_precision) in enumerate(
         payload_info
@@ -517,7 +544,7 @@ def _get_gps_data_with_sticky_metadata(
                 extended_value = gps5_tuple + (gps_fix, gps_precision)
                 data.append((int(timestamp_ms), extended_value))
 
-                if time_base is not None and reading_duration_pts is not None:
+                if time_base is not None:
                     pts_value = base_pts + (i * reading_duration_pts)
                     pts_seconds = pts_value * time_base[0] / time_base[1]
                     pts_data.append((pts_seconds, extended_value))
