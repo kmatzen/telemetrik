@@ -263,7 +263,7 @@ def _divisor_at(scale_divisor: ScaleDivisor, index: int) -> float:
     return scale_divisor
 
 
-def _scaled(raw: int, divisor: float) -> int | float:
+def _scaled(raw: int, divisor: float) -> Union[int, float]:
     """Divide *raw* by *divisor*, leaving the value unchanged when the divisor is 0."""
     if divisor == 0:
         return raw
