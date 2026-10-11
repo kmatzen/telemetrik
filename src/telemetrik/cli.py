@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import struct
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -128,7 +129,7 @@ def main() -> None:
         print(f"{video_path}:")
         try:
             telemetry = extract_all_telemetry(str(video_path), streams=streams)
-        except ValueError as e:
+        except (ValueError, struct.error, IndexError, ZeroDivisionError) as e:
             print(f"  Error: {e}", file=sys.stderr)
             had_failure = True
             continue

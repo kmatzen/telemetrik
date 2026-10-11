@@ -134,7 +134,16 @@ def get_samples(f: BinaryIO, stbl: Box) -> list[Sample]:
     else:
         raise ValueError("Sample table has no chunk offset box (stco/co64).")
 
-    # Sample durations (stts) → used to compute DTS
+    if len(sample_offsets) < len(sample_sizes):
+        raise ValueError(
+            f"Sample table has {len(sample_offsets)} chunk offsets (stco/co64) "
+            f"but {len(sample_sizes)} sample sizes (stsz)."
+        )
+
+    # Sample durations (stts) → used to compute DTS. A missing stts box is
+    # legal in MP4 but leaves every sample at DTS 0 (the durations table
+    # stays empty below), so all DTS/PTS values will read as 0.
+
     sample_durations = []
     stts_boxes = get_boxes(f, stbl.offset, stbl.size, box_path=["stbl", "stts"])
     if stts_boxes:
@@ -242,136 +251,107 @@ ScaleDivisor = Union[float, tuple[float, ...]]
 
 
 def _divisor_at(scale_divisor: ScaleDivisor, index: int) -> float:
-    """Look up the divisor for channel *index*, broadcasting a scalar/single-value SCAL."""
+    """Look up the divisor for channel *index*, broadcasting a scalar/single-value SCAL.
+
+    A SCAL with fewer divisors than the stream's channels clamps to the last
+    divisor instead of raising IndexError.
+    """
     if isinstance(scale_divisor, tuple):
-        return scale_divisor[index] if len(scale_divisor) > 1 else scale_divisor[0]
+        if len(scale_divisor) == 1:
+            return scale_divisor[0]
+        return scale_divisor[min(index, len(scale_divisor) - 1)]
     return scale_divisor
 
 
+def _scaled(raw: int, divisor: float) -> int | float:
+    """Divide *raw* by *divisor*, leaving the value unchanged when the divisor is 0."""
+    if divisor == 0:
+        return raw
+    return raw / divisor
+
+
+def _read(f: BinaryIO, n: int, context: str) -> bytes:
+    """Read exactly *n* bytes, raising ValueError (not struct.error) when truncated."""
+    buf = f.read(n)
+    if len(buf) < n:
+        raise ValueError(f"Truncated GPMF payload ({context}): expected {n} bytes, read {len(buf)}.")
+    return buf
+
+
 def _parse_gpmf_value(
-    f: BinaryIO, type_char: Optional[str], struct_size: int, scale_divisor: ScaleDivisor
+    f: BinaryIO,
+    type_char: Optional[str],
+    struct_size: int,
+    repeat: int,
+    scale_divisor: ScaleDivisor,
 ) -> Any:
-    """Parse a single GPMF value based on its type character."""
+    """Parse a single GPMF value based on its type character.
+
+    *struct_size* must be a multiple of the type's element size, otherwise
+    per-element decoding would misalign the file cursor.
+    """
     if type_char is None:
         return None
 
-    # Signed 16-bit integer
-    if type_char == "s":
-        if struct_size == 2:
-            return _from_bytes(f.read(2), signed=True) / _divisor_at(scale_divisor, 0)
-        else:
-            return tuple(
-                _from_bytes(f.read(2), signed=True) / _divisor_at(scale_divisor, i)
-                for i in range(struct_size // 2)
+    # Element size (bytes) for the numeric types. String-like types are handled
+    # below via a raw read, so they are excluded here.
+    elem_size = {"s": 2, "l": 4, "S": 2, "L": 4, "f": 4, "d": 8, "j": 8, "J": 8, "b": 1, "B": 1, "q": 4}
+    if type_char in elem_size:
+        if struct_size % elem_size[type_char] != 0:
+            raise ValueError(
+                f"GPMF type '{type_char}' has element size {elem_size[type_char]} but "
+                f"struct_size {struct_size} is not a multiple of it."
             )
-
-    # Signed 32-bit integer
-    elif type_char == "l":
-        if struct_size == 4:
-            return _from_bytes(f.read(4), signed=True) / _divisor_at(scale_divisor, 0)
+        n_elems = struct_size // elem_size[type_char]
+        if type_char == "f":
+            values = [struct.unpack(">f", _read(f, 4, "'f' element"))[0] for _ in range(n_elems)]
+        elif type_char == "d":
+            values = [struct.unpack(">d", _read(f, 8, "'d' element"))[0] for _ in range(n_elems)]
+        elif type_char == "q":
+            # Q15.16 fixed-point
+            values = [
+                _from_bytes(_read(f, 4, "'q' element"), signed=True) / 65536.0
+                for _ in range(n_elems)
+            ]
         else:
-            return tuple(
-                _from_bytes(f.read(4), signed=True) / _divisor_at(scale_divisor, i)
-                for i in range(struct_size // 4)
-            )
-
-    # Unsigned 16-bit integer
-    elif type_char == "S":
-        if struct_size == 2:
-            return _from_bytes(f.read(2)) / _divisor_at(scale_divisor, 0)
-        else:
-            return tuple(
-                _from_bytes(f.read(2)) / _divisor_at(scale_divisor, i)
-                for i in range(struct_size // 2)
-            )
-
-    # Unsigned 32-bit integer
-    elif type_char == "L":
-        if struct_size == 4:
-            return _from_bytes(f.read(4)) / _divisor_at(scale_divisor, 0)
-        else:
-            return tuple(
-                _from_bytes(f.read(4)) / _divisor_at(scale_divisor, i)
-                for i in range(struct_size // 4)
-            )
-
-    # Float (32-bit)
-    elif type_char == "f":
-        if struct_size == 4:
-            return struct.unpack(">f", f.read(4))[0]
-        else:
-            return tuple(struct.unpack(">f", f.read(4))[0] for _ in range(struct_size // 4))
-
-    # Double (64-bit float)
-    elif type_char == "d":
-        if struct_size == 8:
-            return struct.unpack(">d", f.read(8))[0]
-        else:
-            return tuple(struct.unpack(">d", f.read(8))[0] for _ in range(struct_size // 8))
-
-    # Signed 64-bit integer
-    elif type_char == "j":
-        if struct_size == 8:
-            return _from_bytes(f.read(8), signed=True) / _divisor_at(scale_divisor, 0)
-        else:
-            return tuple(
-                _from_bytes(f.read(8), signed=True) / _divisor_at(scale_divisor, i)
-                for i in range(struct_size // 8)
-            )
-
-    # Unsigned 64-bit integer
-    elif type_char == "J":
-        if struct_size == 8:
-            return _from_bytes(f.read(8)) / _divisor_at(scale_divisor, 0)
-        else:
-            return tuple(
-                _from_bytes(f.read(8)) / _divisor_at(scale_divisor, i)
-                for i in range(struct_size // 8)
-            )
-
-    # Signed byte
-    elif type_char == "b":
-        if struct_size == 1:
-            return _from_bytes(f.read(1), signed=True) / _divisor_at(scale_divisor, 0)
-        else:
-            return tuple(
-                _from_bytes(f.read(1), signed=True) / _divisor_at(scale_divisor, i)
-                for i in range(struct_size)
-            )
-
-    # Unsigned byte
-    elif type_char == "B":
-        if struct_size == 1:
-            return _from_bytes(f.read(1)) / _divisor_at(scale_divisor, 0)
-        else:
-            return tuple(
-                _from_bytes(f.read(1)) / _divisor_at(scale_divisor, i) for i in range(struct_size)
-            )
+            signed = type_char in ("s", "l", "j", "b")
+            if n_elems == 1:
+                values = [
+                    _scaled(
+                        _from_bytes(
+                            _read(f, elem_size[type_char], f"'{type_char}' value"), signed=signed
+                        ),
+                        _divisor_at(scale_divisor, 0),
+                    )
+                ]
+            else:
+                values = [
+                    _scaled(
+                        _from_bytes(
+                            _read(f, elem_size[type_char], f"'{type_char}' element {i}"),
+                            signed=signed,
+                        ),
+                        _divisor_at(scale_divisor, i),
+                    )
+                    for i in range(n_elems)
+                ]
+        return values[0] if n_elems == 1 else tuple(values)
 
     # String/character
-    elif type_char == "c":
-        return f.read(struct_size).decode("ascii").rstrip("\x00")
+    if type_char == "c":
+        return _read(f, struct_size, "'c' string").decode("ascii").rstrip("\x00")
 
     # FourCC code
     elif type_char == "F":
-        return f.read(struct_size).decode("ascii")
+        return _read(f, struct_size, "'F' FourCC").decode("ascii")
 
     # UTC date/time string ("YYMMDDhhmmss.sss")
     elif type_char == "U":
-        return f.read(struct_size).decode("ascii").rstrip("\x00")
-
-    # Q15.16 fixed-point number
-    elif type_char == "q":
-        if struct_size == 4:
-            return _from_bytes(f.read(4), signed=True) / 65536.0
-        else:
-            return tuple(
-                _from_bytes(f.read(4), signed=True) / 65536.0 for _ in range(struct_size // 4)
-            )
+        return _read(f, struct_size, "'U' time string").decode("ascii").rstrip("\x00")
 
     # Default: raw bytes
     else:
-        return f.read(struct_size)
+        return _read(f, struct_size, f"'{type_char}' payload")
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +509,9 @@ def _decode_stream_values(
         for i in range(stream_box.repeat):
             timestamp_ms = base_timestamp_ms + (i * reading_duration_ms)
 
-            raw_value = _parse_gpmf_value(f, stream_box.type, stream_box.struct_size, scale_divisor)
+            raw_value = _parse_gpmf_value(
+                f, stream_box.type, stream_box.struct_size, stream_box.repeat, scale_divisor
+            )
             value = transform(raw_value, sticky) if transform is not None else raw_value
             if value is None:
                 continue
