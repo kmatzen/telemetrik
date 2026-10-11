@@ -274,7 +274,9 @@ def _read(f: BinaryIO, n: int, context: str) -> bytes:
     """Read exactly *n* bytes, raising ValueError (not struct.error) when truncated."""
     buf = f.read(n)
     if len(buf) < n:
-        raise ValueError(f"Truncated GPMF payload ({context}): expected {n} bytes, read {len(buf)}.")
+        raise ValueError(
+            f"Truncated GPMF payload ({context}): expected {n} bytes, read {len(buf)}."
+        )
     return buf
 
 
@@ -295,7 +297,19 @@ def _parse_gpmf_value(
 
     # Element size (bytes) for the numeric types. String-like types are handled
     # below via a raw read, so they are excluded here.
-    elem_size = {"s": 2, "l": 4, "S": 2, "L": 4, "f": 4, "d": 8, "j": 8, "J": 8, "b": 1, "B": 1, "q": 4}
+    elem_size = {
+        "s": 2,
+        "l": 4,
+        "S": 2,
+        "L": 4,
+        "f": 4,
+        "d": 8,
+        "j": 8,
+        "J": 8,
+        "b": 1,
+        "B": 1,
+        "q": 4,
+    }
     if type_char in elem_size:
         if struct_size % elem_size[type_char] != 0:
             raise ValueError(
