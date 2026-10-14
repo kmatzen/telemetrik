@@ -16,7 +16,7 @@ from telemetrik.parser import TelemetryStream
 
 def _make_stream(key="ACCL", data=None, pts_data=None):
     if data is None:
-        data = [(0, (1.0, 2.0, 3.0)), (10, (4.0, 5.0, 6.0))]
+        data = [(0.0, (1.0, 2.0, 3.0)), (10.0, (4.0, 5.0, 6.0))]
     return TelemetryStream(
         key=key,
         sample_count=len(data),
@@ -38,8 +38,8 @@ def test_save_stream_to_file_writes_header_and_rows(tmp_path):
     with open(output_path, newline="") as f:
         rows = list(csv.reader(f))
     assert rows[0] == ["timestamp_ms", "x", "y", "z"]
-    assert rows[1] == ["0", "1.0", "2.0", "3.0"]
-    assert rows[2] == ["10", "4.0", "5.0", "6.0"]
+    assert rows[1] == ["0.0", "1.0", "2.0", "3.0"]
+    assert rows[2] == ["10.0", "4.0", "5.0", "6.0"]
 
 
 def test_save_stream_to_file_unknown_stream_uses_generic_column_names(tmp_path):
@@ -169,3 +169,40 @@ def test_main_reports_no_telemetry_without_failing(tmp_path, monkeypatch, capsys
     main()  # must not raise SystemExit
 
     assert "No telemetry found" in capsys.readouterr().out
+
+
+def test_main_does_not_crash_when_video_path_is_a_directory(tmp_path, monkeypatch, capsys):
+    """A directory (or other OSError on open) must print an error and exit 1,
+    not crash with a traceback."""
+    monkeypatch.setattr(sys, "argv", ["telemetrik", str(tmp_path)])
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+
+    assert exc_info.value.code == 1
+    assert "Error" in capsys.readouterr().err
+
+
+def test_main_continues_after_save_failure(tmp_path, monkeypatch, capsys):
+    """An unwritable output dir must not crash the CLI for remaining streams."""
+    video_path = tmp_path / "GX010042.MP4"
+    video_path.touch()
+    stream = _make_stream()
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    out_dir.chmod(0o555)
+    try:
+        monkeypatch.setattr(
+            sys, "argv", ["telemetrik", str(video_path), "--output-dir", str(out_dir)]
+        )
+        monkeypatch.setattr(
+            "telemetrik.cli.extract_all_telemetry", lambda path, streams=None: {"ACCL": stream}
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+        assert exc_info.value.code == 1
+        assert "Error" in capsys.readouterr().err
+    finally:
+        out_dir.chmod(0o755)
