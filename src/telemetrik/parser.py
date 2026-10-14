@@ -104,57 +104,101 @@ def get_samples(f: BinaryIO, stbl: Box) -> list[Sample]:
     """Parse the sample table (stbl) and return :class:`Sample` objects with PTS/DTS."""
     # Sample sizes (stsz)
     sample_sizes = []
-    stsz = get_boxes(f, stbl.offset, stbl.size, box_path=["stbl", "stsz"])[0]
+    stsz_boxes = get_boxes(f, stbl.offset, stbl.size, box_path=["stbl", "stsz"])
+    if not stsz_boxes:
+        raise ValueError("Sample table is missing the sample size box (stsz).")
+    stsz = stsz_boxes[0]
     f.seek(stsz.offset + 12)
-    sample_size = _from_bytes(f.read(4))
-    num_entries = _from_bytes(f.read(4))
+    sample_size = _from_bytes(_read(f, 4, "stsz sample_size"))
+    num_entries = _from_bytes(_read(f, 4, "stsz entry count"))
     if sample_size != 0:
         sample_sizes = [sample_size] * num_entries
     else:
         for _ in range(num_entries):
-            sample_sizes.append(_from_bytes(f.read(4)))
+            sample_sizes.append(_from_bytes(_read(f, 4, "stsz entry")))
 
-    # Sample offsets: 32-bit (stco), or 64-bit (co64) for files with sample data
+    # Chunk offsets: 32-bit (stco), or 64-bit (co64) for files with sample data
     # beyond the 4 GB mark.
-    sample_offsets = []
+    chunk_offsets = []
     stco_boxes = get_boxes(f, stbl.offset, stbl.size, box_path=["stbl", "stco"])
     co64_boxes = get_boxes(f, stbl.offset, stbl.size, box_path=["stbl", "co64"])
     if stco_boxes:
         stco = stco_boxes[0]
         f.seek(stco.offset + 12)
-        num_entries = _from_bytes(f.read(4))
+        num_entries = _from_bytes(_read(f, 4, "stco entry count"))
         for _ in range(num_entries):
-            sample_offsets.append(_from_bytes(f.read(4)))
+            chunk_offsets.append(_from_bytes(_read(f, 4, "stco entry")))
     elif co64_boxes:
         co64 = co64_boxes[0]
         f.seek(co64.offset + 12)
-        num_entries = _from_bytes(f.read(4))
+        num_entries = _from_bytes(_read(f, 4, "co64 entry count"))
         for _ in range(num_entries):
-            sample_offsets.append(_from_bytes(f.read(8)))
+            chunk_offsets.append(_from_bytes(_read(f, 8, "co64 entry")))
     else:
         raise ValueError("Sample table has no chunk offset box (stco/co64).")
 
+    # Sample-to-chunk (stsc): maps chunks to samples. When present, a chunk may
+    # hold several samples back-to-back, so per-sample offsets must be expanded
+    # from the chunk offsets plus the running sample sizes. Without stsc, each
+    # chunk holds exactly one sample (chunk offset == sample offset).
+    sample_offsets: list[int] = []
+    stsc_boxes = get_boxes(f, stbl.offset, stbl.size, box_path=["stbl", "stsc"])
+    if stsc_boxes:
+        stsc = stsc_boxes[0]
+        f.seek(stsc.offset + 12)
+        num_entries = _from_bytes(_read(f, 4, "stsc entry count"))
+        stsc_entries = []
+        for _ in range(num_entries):
+            first_chunk = _from_bytes(_read(f, 4, "stsc first_chunk"))
+            samples_per_chunk = _from_bytes(_read(f, 4, "stsc samples_per_chunk"))
+            _read(f, 4, "stsc sample_description_index")
+            stsc_entries.append((first_chunk, samples_per_chunk))
+        for chunk_index, chunk_offset in enumerate(chunk_offsets):
+            # stsc first_chunk is 1-based.
+            chunk_number = chunk_index + 1
+            samples_per_chunk = 1
+            for first_chunk, spc in stsc_entries:
+                if first_chunk <= chunk_number:
+                    # samples_per_chunk == 0 means "variable", i.e. one sample
+                    # per chunk.
+                    samples_per_chunk = spc if spc != 0 else 1
+                else:
+                    break
+            offset_in_chunk = 0
+            for _ in range(samples_per_chunk):
+                if len(sample_offsets) >= len(sample_sizes):
+                    break
+                sample_offsets.append(chunk_offset + offset_in_chunk)
+                offset_in_chunk += sample_sizes[len(sample_offsets) - 1]
+    else:
+        sample_offsets = list(chunk_offsets)
+
     if len(sample_offsets) < len(sample_sizes):
         raise ValueError(
-            f"Sample table has {len(sample_offsets)} chunk offsets (stco/co64) "
-            f"but {len(sample_sizes)} sample sizes (stsz)."
+            f"Sample table has {len(sample_offsets)} sample offsets "
+            f"(stco/co64 + stsc) but {len(sample_sizes)} sample sizes (stsz)."
         )
 
     # Sample durations (stts) → used to compute DTS. A missing stts box is
     # legal in MP4 but leaves every sample at DTS 0 (the durations table
     # stays empty below), so all DTS/PTS values will read as 0.
 
-    sample_durations = []
+    sample_durations: list[int] = []
     stts_boxes = get_boxes(f, stbl.offset, stbl.size, box_path=["stbl", "stts"])
     if stts_boxes:
         stts = stts_boxes[0]
         f.seek(stts.offset + 12)
         num_entries = _from_bytes(f.read(4))
+        # Cap the expansion at the number of samples: a corrupted or malicious
+        # sample_count (the field is a 32-bit int) must not blow up memory.
         for _ in range(num_entries):
-            sample_count = _from_bytes(f.read(4))
-            sample_delta = _from_bytes(f.read(4))
-            for _ in range(sample_count):
+            sample_count = _from_bytes(_read(f, 4, "stts sample_count"))
+            sample_delta = _from_bytes(_read(f, 4, "stts sample_delta"))
+            remaining = len(sample_sizes) - len(sample_durations)
+            for _ in range(min(sample_count, remaining)):
                 sample_durations.append(sample_delta)
+            if remaining <= 0:
+                break
 
     # Composition time offsets (ctts) → PTS = DTS + offset
     composition_offsets = [0] * len(sample_sizes)
@@ -162,15 +206,16 @@ def get_samples(f: BinaryIO, stbl: Box) -> list[Sample]:
     if ctts_boxes:
         ctts = ctts_boxes[0]
         f.seek(ctts.offset + 12)
-        num_entries = _from_bytes(f.read(4))
+        num_entries = _from_bytes(_read(f, 4, "ctts entry count"))
         offset_index = 0
         for _ in range(num_entries):
-            sample_count = _from_bytes(f.read(4))
-            sample_offset = _from_bytes(f.read(4))
-            for _ in range(sample_count):
-                if offset_index < len(composition_offsets):
-                    composition_offsets[offset_index] = sample_offset
-                    offset_index += 1
+            sample_count = _from_bytes(_read(f, 4, "ctts sample_count"))
+            sample_offset = _from_bytes(_read(f, 4, "ctts sample_offset"))
+            for _ in range(min(sample_count, len(composition_offsets) - offset_index)):
+                composition_offsets[offset_index] = sample_offset
+                offset_index += 1
+            if offset_index >= len(composition_offsets):
+                break
 
     samples = []
     current_dts = 0
@@ -263,7 +308,7 @@ def _divisor_at(scale_divisor: ScaleDivisor, index: int) -> float:
     return scale_divisor
 
 
-def _scaled(raw: int, divisor: float) -> Union[int, float]:
+def _scaled(raw: Union[int, float], divisor: float) -> Union[int, float]:
     """Divide *raw* by *divisor*, leaving the value unchanged when the divisor is 0."""
     if divisor == 0:
         return raw
@@ -318,9 +363,21 @@ def _parse_gpmf_value(
             )
         n_elems = struct_size // elem_size[type_char]
         if type_char == "f":
-            values = [struct.unpack(">f", _read(f, 4, "'f' element"))[0] for _ in range(n_elems)]
+            values = [
+                _scaled(
+                    struct.unpack(">f", _read(f, 4, "'f' element"))[0],
+                    _divisor_at(scale_divisor, i),
+                )
+                for i in range(n_elems)
+            ]
         elif type_char == "d":
-            values = [struct.unpack(">d", _read(f, 8, "'d' element"))[0] for _ in range(n_elems)]
+            values = [
+                _scaled(
+                    struct.unpack(">d", _read(f, 8, "'d' element"))[0],
+                    _divisor_at(scale_divisor, i),
+                )
+                for i in range(n_elems)
+            ]
         elif type_char == "q":
             # Q15.16 fixed-point
             values = [
@@ -353,15 +410,16 @@ def _parse_gpmf_value(
 
     # String/character
     if type_char == "c":
-        return _read(f, struct_size, "'c' string").decode("ascii").rstrip("\x00")
+        return _read(f, struct_size, "'c' string").decode("ascii", errors="replace").rstrip("\x00")
 
     # FourCC code
     elif type_char == "F":
-        return _read(f, struct_size, "'F' FourCC").decode("ascii")
+        return _read(f, struct_size, "'F' FourCC").decode("ascii", errors="replace")
 
     # UTC date/time string ("YYMMDDhhmmss.sss")
     elif type_char == "U":
-        return _read(f, struct_size, "'U' time string").decode("ascii").rstrip("\x00")
+        raw = _read(f, struct_size, "'U' time string")
+        return raw.decode("ascii", errors="replace").rstrip("\x00")
 
     # Default: raw bytes
     else:
@@ -382,7 +440,8 @@ class TelemetryStream:
         sample_count: Total number of readings.
         name: Human-readable name from STNM tag.
         units: SI units string from SIUN tag.
-        data: List of ``(timestamp_ms, value)`` tuples using STMP timing.
+        data: List of ``(timestamp_ms, value)`` tuples using STMP timing
+            (float milliseconds; fractional values are preserved).
         pts_data: Optional list of ``(pts_seconds, value)`` tuples mapped to
             the video presentation timeline.
     """
@@ -391,7 +450,7 @@ class TelemetryStream:
     sample_count: int
     name: str
     units: str
-    data: list[tuple[int, Any]]
+    data: list[tuple[float, Any]]
     pts_data: Optional[list[tuple[float, Any]]] = None
 
 
@@ -482,7 +541,7 @@ def _decode_stream_values(
     sample_pts_list: list[int],
     time_base: Optional[tuple[int, int]],
     transform: Optional[Callable[[Any, tuple[int, ...]], Optional[Any]]] = None,
-) -> tuple[list[tuple[int, Any]], list[tuple[float, Any]], int, str, str]:
+) -> tuple[list[tuple[float, Any]], list[tuple[float, Any]], int, str, str]:
     """
     Decode each payload's raw values with interpolated STMP/PTS timestamps,
     collecting the stream's name (STNM) and units (SIUN) along the way.
@@ -510,63 +569,74 @@ def _decode_stream_values(
         base_timestamp_ms = stmp_timestamps[payload_idx]
         base_pts = sample_pts_list[payload_idx]
 
-        if payload_idx + 1 < len(stmp_timestamps):
-            next_stmp_ms = stmp_timestamps[payload_idx + 1]
-            delta_stmp_ms = next_stmp_ms - base_timestamp_ms
-            reading_duration_ms = delta_stmp_ms / stream_box.repeat
+        # A payload with repeat == 0 carries no readings; skipping it avoids a
+        # division by zero when interpolating timestamps.
+        if stream_box.repeat > 0:
+            if payload_idx + 1 < len(stmp_timestamps):
+                next_stmp_ms = stmp_timestamps[payload_idx + 1]
+                delta_stmp_ms = next_stmp_ms - base_timestamp_ms
+                reading_duration_ms = delta_stmp_ms / stream_box.repeat
 
-            if time_base is not None:
-                next_pts = sample_pts_list[payload_idx + 1]
-                delta_pts = next_pts - base_pts
-                reading_duration_pts = delta_pts / stream_box.repeat
+                if time_base is not None:
+                    next_pts = sample_pts_list[payload_idx + 1]
+                    delta_pts = next_pts - base_pts
+                    reading_duration_pts = delta_pts / stream_box.repeat
 
-        for i in range(stream_box.repeat):
-            timestamp_ms = base_timestamp_ms + (i * reading_duration_ms)
+            for i in range(stream_box.repeat):
+                timestamp_ms = base_timestamp_ms + (i * reading_duration_ms)
 
-            raw_value = _parse_gpmf_value(
-                f, stream_box.type, stream_box.struct_size, stream_box.repeat, scale_divisor
-            )
-            value = transform(raw_value, sticky) if transform is not None else raw_value
-            if value is None:
-                continue
-            data.append((int(timestamp_ms), value))
+                raw_value = _parse_gpmf_value(
+                    f, stream_box.type, stream_box.struct_size, stream_box.repeat, scale_divisor
+                )
+                value = transform(raw_value, sticky) if transform is not None else raw_value
+                if value is None:
+                    continue
+                data.append((timestamp_ms, value))
 
-            if time_base is not None:
-                pts_value = base_pts + (i * reading_duration_pts)
-                pts_seconds = pts_value * time_base[0] / time_base[1]
-                pts_data.append((pts_seconds, value))
+                if time_base is not None:
+                    pts_value = base_pts + (i * reading_duration_pts)
+                    pts_seconds = pts_value * time_base[0] / time_base[1]
+                    pts_data.append((pts_seconds, value))
 
-            sample_count += 1
+                sample_count += 1
 
         if name == "":
             stnm_boxes = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", "STNM"])
             if stnm_boxes:
                 stnm = stnm_boxes[0]
                 f.seek(stnm.offset + 8)
-                name = f.read(stnm.struct_size * stnm.repeat).decode("ascii").rstrip("\x00")
+                name = (
+                    f.read(stnm.struct_size * stnm.repeat)
+                    .decode("ascii", errors="replace")
+                    .rstrip("\x00")
+                )
 
         if units == "":
             siun_boxes = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", "SIUN"])
             if siun_boxes:
                 siun = siun_boxes[0]
                 f.seek(siun.offset + 8)
-                for _ in range(siun.struct_size * siun.repeat):
-                    unit_char = f.read(1)
-                    if len(unit_char) == 0:
-                        break
-                    unit_char_value = _from_bytes(unit_char)
-                    if unit_char_value == 0xB0:
-                        units += "\u00b0"
-                    elif unit_char_value == 0xB2:
-                        units += "\u00b2"
-                    elif unit_char_value == 0xB3:
-                        units += "\u00b3"
-                    elif unit_char_value == 0xB5:
-                        units += "\u00b5"
-                    elif unit_char_value == 0x00:
-                        break
-                    else:
-                        units += unit_char.decode("ascii")
+                # Each repeat is one unit string; decode per entry (a NUL pad
+                # byte ends only its own entry) and join with commas.
+                parts = []
+                for _ in range(siun.repeat):
+                    part = ""
+                    for unit_byte in _read(f, siun.struct_size, "SIUN entry"):
+                        if unit_byte == 0xB0:
+                            part += "\u00b0"
+                        elif unit_byte == 0xB2:
+                            part += "\u00b2"
+                        elif unit_byte == 0xB3:
+                            part += "\u00b3"
+                        elif unit_byte == 0xB5:
+                            part += "\u00b5"
+                        elif unit_byte == 0x00:
+                            break
+                        else:
+                            part += bytes([unit_byte]).decode("ascii", errors="replace")
+                    if part:
+                        parts.append(part)
+                units = ",".join(parts)
 
     return data, pts_data, sample_count, name, units
 
@@ -687,7 +757,10 @@ def extract_all_telemetry(
         minf_boxes = get_boxes(f, 0, size, ["moov", "trak", "mdia", "minf"])
         for box in minf_boxes:
             if get_boxes(f, box.offset, box.size, ["minf", "gmhd", "gpmd"]):
-                stbl = get_boxes(f, box.offset, box.size, ["minf", "stbl"])[0]
+                stbl_boxes = get_boxes(f, box.offset, box.size, ["minf", "stbl"])
+                if not stbl_boxes:
+                    continue  # malformed GPMF track; try the next candidate
+                stbl = stbl_boxes[0]
                 mdia_boxes = get_boxes(f, 0, size, ["moov", "trak", "mdia"])
                 for mdia in mdia_boxes:
                     if box.offset >= mdia.offset and box.offset < mdia.offset + mdia.size:
@@ -709,7 +782,9 @@ def extract_all_telemetry(
                     f.read(16)  # skip creation_time + modification_time (64-bit each)
                 else:
                     f.read(8)  # skip creation_time + modification_time (32-bit each)
-                timescale = _from_bytes(f.read(4))
+                timescale = _from_bytes(_read(f, 4, "mdhd timescale"))
+                if timescale == 0:
+                    raise ValueError("GPMF track has a zero mdhd timescale.")
                 time_base = (1, timescale)
 
         samples = get_samples(f, stbl)

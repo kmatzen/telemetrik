@@ -129,7 +129,7 @@ def main() -> None:
         print(f"{video_path}:")
         try:
             telemetry = extract_all_telemetry(str(video_path), streams=streams)
-        except (ValueError, struct.error, IndexError, ZeroDivisionError) as e:
+        except (ValueError, struct.error, IndexError, ZeroDivisionError, OSError) as e:
             print(f"  Error: {e}", file=sys.stderr)
             had_failure = True
             continue
@@ -142,6 +142,9 @@ def main() -> None:
             try:
                 save_stream_to_file(stream, video_path, output_dir, args.force)
             except FileExistsError as e:
+                print(f"  Error: {e}", file=sys.stderr)
+                had_failure = True
+            except OSError as e:
                 print(f"  Error: {e}", file=sys.stderr)
                 had_failure = True
 
