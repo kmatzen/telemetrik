@@ -4,6 +4,10 @@ See AUDIT.md / GitHub issues #1 and #2 for the original bug reports.
 """
 
 import io
+import os
+import struct
+
+import pytest
 
 from telemetrik.parser import (
     Sample,
@@ -19,6 +23,8 @@ from .helpers import (
     gps5_payload,
     gpsf,
     gpsp,
+    klv,
+    mp4_box,
     scal,
     siun,
     stmp,
@@ -205,3 +211,197 @@ def test_gps5_units_are_retried_independently_of_name():
 
     assert stream.name == "GPS (Latitude, Longitude, Altitude)"
     assert stream.units == "m,m,m,m/s,m/s,fix,dop"
+
+
+# ---------------------------------------------------------------------------
+# Bug-bash regression tests (2026-10-14)
+# ---------------------------------------------------------------------------
+
+
+def test_stsc_multi_samples_per_chunk():
+    """stco holds CHUNK offsets; stsc must be honored to expand per-sample
+    offsets when a chunk holds several samples."""
+    from .helpers import _mdhd, _stco, _stsc, _stsz
+
+    p1 = devc(strm(stmp(0) + accl_payload([(1, 2, 3)])))
+    p2 = devc(strm(stmp(1_000_000) + accl_payload([(4, 5, 6)])))
+    gmhd = mp4_box(b"gmhd", mp4_box(b"gpmd", b""))
+
+    def build(offset):
+        stsc = _stsc([(1, 2)])  # chunk 1 holds 2 samples
+        stbl = mp4_box(b"stbl", _stsz([len(p1), len(p2)]) + stsc + _stco([offset]))
+        return mp4_box(
+            b"moov",
+            mp4_box(b"trak", mp4_box(b"mdia", _mdhd(1_000_000) + mp4_box(b"minf", gmhd + stbl))),
+        )
+
+    moov = build(0)
+    moov = build(len(moov))
+    fn = _tmp_path(moov + p1 + p2)
+    try:
+        telemetry = extract_all_telemetry(fn, streams=["ACCL"])
+    finally:
+        os.unlink(fn)
+
+    values = [v for _, v in telemetry["ACCL"].data]
+    assert values == [(1.0, 2.0, 3.0), (4.0, 5.0, 6.0)]
+
+
+def test_repeat_zero_payload_is_skipped():
+    """A stream payload with repeat == 0 must be skipped, not divide by zero."""
+    empty = klv(b"ACCL", ord("s"), 6, 0, b"")
+    p1 = devc(strm(stmp(0) + empty))
+    p2 = devc(strm(stmp(1_000) + accl_payload([(7, 8, 9)])))
+    f = io.BytesIO(p1 + p2)
+
+    stream = get_stream_data(f, [Sample(0, len(p1)), Sample(len(p1), len(p2))], "ACCL")
+
+    assert stream.data == [(1.0, (7.0, 8.0, 9.0))]
+
+
+def test_stts_expansion_is_capped_at_sample_count():
+    """A corrupted 4.29e9 stts sample_count must not expand a huge list."""
+    import struct as _struct
+
+    from .helpers import _mdhd, _stco, _stsz
+
+    p1 = devc(strm(stmp(0) + accl_payload([(1, 2, 3)])))
+    gmhd = mp4_box(b"gmhd", mp4_box(b"gpmd", b""))
+    stts = mp4_box(
+        b"stts",
+        bytes(4)
+        + (1).to_bytes(4, "big")
+        + _struct.pack(">I", 0xFFFFFFFF)  # absurd sample_count
+        + (1).to_bytes(4, "big"),
+    )
+
+    def build(offset):
+        stbl = mp4_box(b"stbl", _stsz([len(p1)]) + _stco([offset]) + stts)
+        return mp4_box(
+            b"moov",
+            mp4_box(b"trak", mp4_box(b"mdia", _mdhd(1_000_000) + mp4_box(b"minf", gmhd + stbl))),
+        )
+
+    moov = build(0)
+    moov = build(len(moov))
+    fn = _tmp_path(moov + p1)
+    try:
+        telemetry = extract_all_telemetry(fn, streams=["ACCL"])
+    finally:
+        os.unlink(fn)
+
+    assert telemetry["ACCL"].sample_count == 1
+
+
+def test_non_ascii_stnm_does_not_kill_extraction():
+    """Non-ASCII bytes in STNM must degrade, not raise UnicodeDecodeError."""
+    name = "Temp\xe9".encode("latin-1")
+    body = stmp(0) + klv(b"STNM", ord("c"), len(name), 1, name) + accl_payload([(1, 2, 3)])
+    payload = devc(strm(body))
+    f = io.BytesIO(payload)
+
+    stream = get_stream_data(f, [Sample(0, len(payload))], "ACCL")
+
+    assert stream.name  # decoded with replacement, not a crash
+    assert stream.sample_count == 1
+
+
+def test_siun_multi_entry_joins_with_commas():
+    """Multi-entry SIUN: NUL padding ends only its own entry; entries are
+    joined with commas."""
+    data = b"m/s\xb2" + b"rad\x00" + b"m\x00\x00\x00"
+    siun = klv(b"SIUN", ord("c"), 4, 3, data)
+    body = stmp(0) + siun + accl_payload([(1, 2, 3)])
+    payload = devc(strm(body))
+    f = io.BytesIO(payload)
+
+    stream = get_stream_data(f, [Sample(0, len(payload))], "ACCL")
+
+    assert stream.units == "m/s\u00b2,rad,m"
+
+
+def test_truncated_stsz_raises_valueerror():
+    """A truncated stsz entry table must raise ValueError, not decode to 0."""
+    from .helpers import _mdhd, _stco
+
+    gmhd = mp4_box(b"gmhd", mp4_box(b"gpmd", b""))
+    # stsz claims 5 entries but has none.
+    stsz = mp4_box(b"stsz", bytes(4) + bytes(4) + (5).to_bytes(4, "big"))
+    moov = mp4_box(
+        b"moov",
+        mp4_box(
+            b"trak",
+            mp4_box(
+                b"mdia",
+                _mdhd(1_000_000) + mp4_box(b"minf", gmhd + mp4_box(b"stbl", stsz + _stco([0] * 5))),
+            ),
+        ),
+    )
+    fn = _tmp_path(moov)
+    try:
+        with pytest.raises(ValueError):
+            extract_all_telemetry(fn, streams=["ACCL"])
+    finally:
+        os.unlink(fn)
+
+
+def test_zero_timescale_raises_valueerror():
+    p1 = devc(strm(stmp(0) + accl_payload([(1, 2, 3)])))
+    fn = _tmp_path(build_gopro_mp4([p1], timescale=0))
+    try:
+        with pytest.raises(ValueError):
+            extract_all_telemetry(fn, streams=["ACCL"])
+    finally:
+        os.unlink(fn)
+
+
+def test_missing_stsz_raises_valueerror():
+    gmhd = mp4_box(b"gmhd", mp4_box(b"gpmd", b""))
+    from .helpers import _mdhd
+
+    moov = mp4_box(
+        b"moov",
+        mp4_box(
+            b"trak",
+            mp4_box(b"mdia", _mdhd(1_000_000) + mp4_box(b"minf", gmhd + mp4_box(b"stbl", b""))),
+        ),
+    )
+    fn = _tmp_path(moov)
+    try:
+        with pytest.raises(ValueError):
+            extract_all_telemetry(fn, streams=["ACCL"])
+    finally:
+        os.unlink(fn)
+
+
+def test_fractional_timestamps_are_preserved():
+    """Three readings over 10 ms must not truncate to [0, 3, 6]."""
+    p1 = devc(strm(stmp(0) + accl_payload([(1, 2, 3)] * 3)))
+    p2 = devc(strm(stmp(10_000) + accl_payload([(1, 2, 3)])))
+    f = io.BytesIO(p1 + p2)
+
+    stream = get_stream_data(f, [Sample(0, len(p1)), Sample(len(p1), len(p2))], "ACCL")
+
+    timestamps = [ts for ts, _ in stream.data]
+    assert timestamps == pytest.approx([0.0, 10 / 3, 20 / 3, 10.0])
+
+
+def test_float_stream_is_scaled_by_scal():
+    """SCAL divisors must apply to 'f'/'d' streams too."""
+    data = struct.pack(">3f", 1000.0, 2000.0, 3000.0)
+    body = stmp(0) + scal([1000]) + klv(b"ACCL", ord("f"), 12, 1, data)
+    payload = devc(strm(body))
+    f = io.BytesIO(payload)
+
+    stream = get_stream_data(f, [Sample(0, len(payload))], "ACCL")
+
+    assert stream.data[0][1] == (1.0, 2.0, 3.0)
+
+
+def _tmp_path(data: bytes) -> str:
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".mp4")
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return path
