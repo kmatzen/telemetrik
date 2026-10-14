@@ -128,6 +128,17 @@ def _stco(offsets: Sequence[int]) -> bytes:
     return mp4_box(b"stco", body)
 
 
+def _stsc(entries: Sequence[tuple[int, int]]) -> bytes:
+    """Sample-to-chunk: entries of (first_chunk [1-based], samples_per_chunk)."""
+    body = bytes(4)
+    body += len(entries).to_bytes(4, "big")
+    for first_chunk, samples_per_chunk in entries:
+        body += first_chunk.to_bytes(4, "big")
+        body += samples_per_chunk.to_bytes(4, "big")
+        body += (1).to_bytes(4, "big")  # sample_description_index
+    return mp4_box(b"stsc", body)
+
+
 def _co64(offsets: Sequence[int]) -> bytes:
     body = bytes(4)
     body += len(offsets).to_bytes(4, "big")
