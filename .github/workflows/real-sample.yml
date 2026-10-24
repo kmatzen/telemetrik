@@ -4,10 +4,21 @@ name: Real-sample regression
 # GoPro file. The sample is not vendored; it is fetched from a pinned
 # gpmf-parser commit and checksum-verified, then cached. Kept in its own
 # workflow so it does not depend on (or collide with) the main lint/test CI.
+# The "Verify sample" step is a hard guard: the test file self-skips when
+# the sample is absent, so without it a cache miss/empty cache would leave
+# the GPS5 regression un-run on a green check.
 on:
   push:
     branches: [main]
   pull_request:
+
+# Least privilege: pip/uv install from PyPI, so a compromised dependency
+# must never inherit a repo-writing GITHUB_TOKEN on PRs.
+permissions:
+  contents: read
+
+env:
+  SAMPLE_SHA256: 8e8fa98887f86119be1b886762b1080a92afb6cc146db719a238bdcba908277b
 
 jobs:
   real-sample:
@@ -19,8 +30,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install package and pytest
-        run: pip install -e . pytest
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install package and dev tools (locked)
+        run: uv sync --frozen
 
       - name: Cache GoPro sample
         id: cache-sample
@@ -37,9 +51,14 @@ jobs:
           mkdir -p sample
           curl -sSL --retry 3 -o sample/max-heromode.mp4 \
             https://raw.githubusercontent.com/gopro/gpmf-parser/e40f6d9d3d7d17c9641c26d60e56d2927151d490/samples/max-heromode.mp4
-          echo "8e8fa98887f86119be1b886762b1080a92afb6cc146db719a238bdcba908277b  sample/max-heromode.mp4" | sha256sum -c -
+          echo "$SAMPLE_SHA256  sample/max-heromode.mp4" | sha256sum -c -
+
+      - name: Verify sample (hard guard - exists, non-empty, checksum)
+        run: |
+          test -s sample/max-heromode.mp4
+          echo "$SAMPLE_SHA256  sample/max-heromode.mp4" | sha256sum -c -
 
       - name: Run real-sample regression test
         env:
           TELEMETRIK_SAMPLE: ${{ github.workspace }}/sample/max-heromode.mp4
-        run: pytest tests/test_real_sample.py -v
+        run: uv run pytest tests/test_real_sample.py -v
