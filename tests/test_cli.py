@@ -6,6 +6,7 @@ had no header and didn't use the csv module.
 """
 
 import csv
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -113,9 +114,13 @@ def test_save_stream_to_file_refuses_to_overwrite_without_force(tmp_path):
     existing = tmp_path / "GX010042.accl"
     existing.write_text("existing content")
 
-    with pytest.raises(FileExistsError):
+    with pytest.raises(FileExistsError) as excinfo:
         save_stream_to_file(stream, video_path)
 
+    # The CLI is the only place a user learns --force exists (the README never
+    # quotes it), so the hint must survive the exclusive-create refactor.
+    assert "force" in str(excinfo.value)
+    assert "--force" in str(excinfo.value)
     assert existing.read_text() == "existing content"
 
 
@@ -149,8 +154,14 @@ def test_save_stream_to_file_with_force_does_not_follow_symlink(tmp_path):
     assert link.is_symlink()
 
 
-def test_save_stream_to_file_without_force_does_not_follow_symlink(tmp_path):
-    """Exclusive create must refuse a symlinked output path instead of writing through it."""
+def test_save_stream_to_file_without_force_refuses_existing_symlink_output(tmp_path):
+    """Exclusive create refuses a symlinked output path, leaving the target intact.
+
+    Pins the *observable* contract only: the file is refused and the target is
+    untouched. It cannot observe the check-then-write race window (main's
+    exists() check passed for the same input); the force=True sibling, which
+    shows O_NOFOLLOW doing the work, is the race-sensitive test.
+    """
     stream = _make_stream()
     video_path = tmp_path / "GX010042.MP4"
     video_path.touch()
@@ -176,6 +187,71 @@ def test_save_stream_to_file_uses_pts_seconds_converted_to_ms(tmp_path):
         rows = list(csv.reader(f))
     assert rows[1][0] == "0.0"
     assert rows[2][0] == "500.0"
+
+
+def test_main_passes_max_readings_to_extraction(tmp_path, monkeypatch):
+    video_path = tmp_path / "GX010042.MP4"
+    video_path.touch()
+    stream = _make_stream()
+    captured = {}
+
+    def fake_extract(path, streams=None, max_readings=None):
+        captured["streams"] = streams
+        captured["max_readings"] = max_readings
+        return {"ACCL": stream}
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["telemetrik", str(video_path), "--streams", "ACCL", "--max-readings", "5000"],
+    )
+    monkeypatch.setattr("telemetrik.cli.extract_all_telemetry", fake_extract)
+
+    main()
+
+    assert captured["streams"] == ["ACCL"]
+    assert captured["max_readings"] == 5000
+
+
+def test_main_max_readings_defaults_to_none(tmp_path, monkeypatch):
+    video_path = tmp_path / "GX010042.MP4"
+    video_path.touch()
+    captured = {}
+
+    def fake_extract(path, streams=None, max_readings=None):
+        captured["max_readings"] = max_readings
+        return {}
+
+    monkeypatch.setattr(sys, "argv", ["telemetrik", str(video_path)])
+    monkeypatch.setattr("telemetrik.cli.extract_all_telemetry", fake_extract)
+
+    main()
+
+    assert captured["max_readings"] is None
+
+
+def test_main_reports_max_readings_cap_as_clean_error(tmp_path, monkeypatch, capsys):
+    """Hitting the cap must print 'Error: …' and exit 1, not raise a traceback."""
+    video_path = tmp_path / "GX010042.MP4"
+    video_path.touch()
+
+    def fake_extract(path, streams=None, max_readings=None):
+        if max_readings is not None and max_readings < 1000:
+            raise ValueError(
+                f"Telemetry extraction exceeds max_readings={max_readings} (1000 readings)"
+            )
+        return {"ACCL": _make_stream()}
+
+    monkeypatch.setattr(sys, "argv", ["telemetrik", str(video_path), "--max-readings", "10"])
+    monkeypatch.setattr("telemetrik.cli.extract_all_telemetry", fake_extract)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+
+    err = capsys.readouterr().err
+    assert exc_info.value.code == 1
+    assert "Error" in err and "max_readings" in err
+    assert "Traceback" not in err
 
 
 def test_main_exits_nonzero_when_a_file_is_missing(tmp_path, monkeypatch):
@@ -205,7 +281,8 @@ def test_main_writes_files_and_does_not_exit_on_success(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sys, "argv", ["telemetrik", str(video_path)])
     monkeypatch.setattr(
-        "telemetrik.cli.extract_all_telemetry", lambda path, streams=None: {"ACCL": stream}
+        "telemetrik.cli.extract_all_telemetry",
+        lambda path, streams=None, max_readings=None: {"ACCL": stream},
     )
 
     main()  # must not raise SystemExit
@@ -223,7 +300,8 @@ def test_main_respects_output_dir_flag(tmp_path, monkeypatch):
         sys, "argv", ["telemetrik", str(video_path), "--output-dir", str(output_dir)]
     )
     monkeypatch.setattr(
-        "telemetrik.cli.extract_all_telemetry", lambda path, streams=None: {"ACCL": stream}
+        "telemetrik.cli.extract_all_telemetry",
+        lambda path, streams=None, max_readings=None: {"ACCL": stream},
     )
 
     main()
@@ -236,7 +314,9 @@ def test_main_reports_no_telemetry_without_failing(tmp_path, monkeypatch, capsys
     video_path.touch()
 
     monkeypatch.setattr(sys, "argv", ["telemetrik", str(video_path)])
-    monkeypatch.setattr("telemetrik.cli.extract_all_telemetry", lambda path, streams=None: {})
+    monkeypatch.setattr(
+        "telemetrik.cli.extract_all_telemetry", lambda path, streams=None, max_readings=None: {}
+    )
 
     main()  # must not raise SystemExit
 
@@ -291,6 +371,15 @@ def test_cli_has_no_dead_struct_error_handler():
     assert "ZeroDivisionError" not in source
 
 
+def test_cli_has_no_duplicate_file_exists_error_handler():
+    """FileExistsError subclasses OSError, so an identical-bodied arm before
+    'except OSError' in main() can never change behaviour (it existed for a
+    bespoke message that is now raised inside _open_output)."""
+    main_source = inspect.getsource(cli.main)
+    assert "except FileExistsError" not in main_source
+    assert "except OSError" in main_source
+
+
 def test_main_continues_after_save_failure(tmp_path, monkeypatch, capsys):
     """An unwritable output dir must not crash the CLI for remaining streams."""
     video_path = tmp_path / "GX010042.MP4"
@@ -304,7 +393,8 @@ def test_main_continues_after_save_failure(tmp_path, monkeypatch, capsys):
             sys, "argv", ["telemetrik", str(video_path), "--output-dir", str(out_dir)]
         )
         monkeypatch.setattr(
-            "telemetrik.cli.extract_all_telemetry", lambda path, streams=None: {"ACCL": stream}
+            "telemetrik.cli.extract_all_telemetry",
+            lambda path, streams=None, max_readings=None: {"ACCL": stream},
         )
 
         with pytest.raises(SystemExit) as exc_info:
