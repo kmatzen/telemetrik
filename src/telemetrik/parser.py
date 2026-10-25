@@ -8,9 +8,9 @@ Extended with PTS/DTS timestamps, GPS sticky metadata, unified extraction
 API, and additional stream support.
 """
 
+import os
 import struct
 from dataclasses import dataclass
-from math import ceil
 from os.path import getsize
 from typing import Any, BinaryIO, Callable, Optional, Union
 
@@ -30,7 +30,6 @@ def _from_bytes(*args: Any, **kwargs: Any) -> int:
 class Box:
     """An MP4 box (atom)."""
 
-    key: str
     offset: int
     size: int
 
@@ -77,12 +76,38 @@ def get_boxes(f: BinaryIO, offset: int, size: int, box_path: list[str]) -> list[
 
         if key == box_path[0]:
             if len(box_path) == 1:
-                boxes += [Box(key, offset, box_size)]
+                boxes += [Box(offset, box_size)]
             else:
                 boxes += get_boxes(f, offset + header_len, box_size - header_len, box_path[1:])
         offset += box_size
         f.seek(offset)
     return boxes
+
+
+def _file_size(f: BinaryIO) -> int:
+    """Total size of *f*; restores the cursor."""
+    position = f.tell()
+    size = f.seek(0, os.SEEK_END)
+    f.seek(position)
+    return size
+
+
+def _entry_count(f: BinaryIO, box: Box, context: str, entry_size: int) -> int:
+    """Read a full-box entry count at the cursor, bounded by the box's own size.
+
+    Entry counts are raw 32-bit ints taken straight from the file (legal up to
+    4,294,967,295). Checking the count against the bytes the box actually has
+    left, *before* it drives a loop, is what keeps a forged count from costing
+    gigabytes of memory.
+    """
+    num_entries = _from_bytes(_read(f, 4, context))
+    available = max(box.offset + box.size - f.tell(), 0)
+    if num_entries > available // entry_size:
+        raise ValueError(
+            f"{context} declares {num_entries} entries of {entry_size} bytes, "
+            f"but its box leaves {available}."
+        )
+    return num_entries
 
 
 # ---------------------------------------------------------------------------
@@ -92,16 +117,15 @@ def get_boxes(f: BinaryIO, offset: int, size: int, box_path: list[str]) -> list[
 
 @dataclass()
 class Sample:
-    """A sample from the MP4 sample table, with optional PTS/DTS."""
+    """A sample from the MP4 sample table, with optional PTS."""
 
     offset: int
     size: int
     pts: Optional[int] = None
-    dts: Optional[int] = None
 
 
 def get_samples(f: BinaryIO, stbl: Box) -> list[Sample]:
-    """Parse the sample table (stbl) and return :class:`Sample` objects with PTS/DTS."""
+    """Parse the sample table (stbl) and return :class:`Sample` objects with PTS."""
     # Sample sizes (stsz)
     sample_sizes = []
     stsz_boxes = get_boxes(f, stbl.offset, stbl.size, box_path=["stbl", "stsz"])
@@ -110,10 +134,19 @@ def get_samples(f: BinaryIO, stbl: Box) -> list[Sample]:
     stsz = stsz_boxes[0]
     f.seek(stsz.offset + 12)
     sample_size = _from_bytes(_read(f, 4, "stsz sample_size"))
-    num_entries = _from_bytes(_read(f, 4, "stsz entry count"))
     if sample_size != 0:
+        # Uniform sizes: no per-entry table follows, so the box offers nothing to
+        # measure against. The file itself is the bound — every sample has to
+        # occupy at least one byte of media data.
+        num_entries = _from_bytes(_read(f, 4, "stsz entry count"))
+        file_size = _file_size(f)
+        if num_entries > file_size:
+            raise ValueError(
+                f"stsz declares {num_entries} samples but the file holds {file_size} bytes."
+            )
         sample_sizes = [sample_size] * num_entries
     else:
+        num_entries = _entry_count(f, stsz, "stsz entry count", 4)
         for _ in range(num_entries):
             sample_sizes.append(_from_bytes(_read(f, 4, "stsz entry")))
 
@@ -125,13 +158,13 @@ def get_samples(f: BinaryIO, stbl: Box) -> list[Sample]:
     if stco_boxes:
         stco = stco_boxes[0]
         f.seek(stco.offset + 12)
-        num_entries = _from_bytes(_read(f, 4, "stco entry count"))
+        num_entries = _entry_count(f, stco, "stco entry count", 4)
         for _ in range(num_entries):
             chunk_offsets.append(_from_bytes(_read(f, 4, "stco entry")))
     elif co64_boxes:
         co64 = co64_boxes[0]
         f.seek(co64.offset + 12)
-        num_entries = _from_bytes(_read(f, 4, "co64 entry count"))
+        num_entries = _entry_count(f, co64, "co64 entry count", 8)
         for _ in range(num_entries):
             chunk_offsets.append(_from_bytes(_read(f, 8, "co64 entry")))
     else:
@@ -146,7 +179,7 @@ def get_samples(f: BinaryIO, stbl: Box) -> list[Sample]:
     if stsc_boxes:
         stsc = stsc_boxes[0]
         f.seek(stsc.offset + 12)
-        num_entries = _from_bytes(_read(f, 4, "stsc entry count"))
+        num_entries = _entry_count(f, stsc, "stsc entry count", 12)
         stsc_entries = []
         for _ in range(num_entries):
             first_chunk = _from_bytes(_read(f, 4, "stsc first_chunk"))
@@ -188,7 +221,7 @@ def get_samples(f: BinaryIO, stbl: Box) -> list[Sample]:
     if stts_boxes:
         stts = stts_boxes[0]
         f.seek(stts.offset + 12)
-        num_entries = _from_bytes(f.read(4))
+        num_entries = _entry_count(f, stts, "stts entry count", 8)
         # Cap the expansion at the number of samples: a corrupted or malicious
         # sample_count (the field is a 32-bit int) must not blow up memory.
         for _ in range(num_entries):
@@ -206,7 +239,7 @@ def get_samples(f: BinaryIO, stbl: Box) -> list[Sample]:
     if ctts_boxes:
         ctts = ctts_boxes[0]
         f.seek(ctts.offset + 12)
-        num_entries = _from_bytes(_read(f, 4, "ctts entry count"))
+        num_entries = _entry_count(f, ctts, "ctts entry count", 8)
         offset_index = 0
         for _ in range(num_entries):
             sample_count = _from_bytes(_read(f, 4, "ctts sample_count"))
@@ -222,7 +255,7 @@ def get_samples(f: BinaryIO, stbl: Box) -> list[Sample]:
     for i in range(len(sample_sizes)):
         dts = current_dts
         pts = dts + composition_offsets[i]
-        samples.append(Sample(sample_offsets[i], sample_sizes[i], pts=pts, dts=dts))
+        samples.append(Sample(sample_offsets[i], sample_sizes[i], pts=pts))
         if i < len(sample_durations):
             current_dts += sample_durations[i]
 
@@ -255,8 +288,9 @@ def get_gpmf_boxes(f: BinaryIO, offset: int, size: int, box_path: list[str]) -> 
     Walk the GPMF KLV hierarchy and return matching elements.
 
     Raises:
-        ValueError: If a KLV header is truncated or has a key/type that isn't
-            valid ASCII.
+        ValueError: If a KLV header is truncated, has a key/type that isn't
+            valid ASCII, or declares a payload running past the end of the box
+            being walked.
     """
     boxes = []
     end = offset + size
@@ -270,22 +304,29 @@ def get_gpmf_boxes(f: BinaryIO, offset: int, size: int, box_path: list[str]) -> 
         except UnicodeDecodeError as exc:
             raise ValueError(f"Invalid GPMF KLV key at offset {offset}.") from exc
         if _from_bytes(header[4:5]) == 0:
-            type = None
+            type_char = None
         else:
             try:
-                type = header[4:5].decode("ascii")
+                type_char = header[4:5].decode("ascii")
             except UnicodeDecodeError as exc:
                 raise ValueError(f"Invalid GPMF KLV type at offset {offset}.") from exc
         struct_size = _from_bytes(header[5:6])
         repeat = _from_bytes(header[6:8])
-        # 32-bit aligned
-        size = ceil((struct_size * repeat + 8) / 4) * 4
+        # 32-bit aligned: header (8) + payload, padded up to a multiple of 4.
+        box_size = ((struct_size * repeat + 8 + 3) // 4) * 4
+        # The declared repeat is a raw 16-bit int from the file; a payload that
+        # runs past this box would read (and invent) the following boxes' bytes.
+        if box_size > end - offset:
+            raise ValueError(
+                f"GPMF KLV '{key}' at offset {offset} declares {box_size} bytes, "
+                f"but only {end - offset} remain in its parent box."
+            )
         if key == box_path[0]:
             if len(box_path) == 1:
-                boxes += [GPMFBox(key, offset, size, type, struct_size, repeat)]
-            elif type is None:
-                boxes += get_gpmf_boxes(f, offset + 8, size - 8, box_path[1:])
-        offset += size
+                boxes += [GPMFBox(key, offset, box_size, type_char, struct_size, repeat)]
+            elif type_char is None:
+                boxes += get_gpmf_boxes(f, offset + 8, box_size - 8, box_path[1:])
+        offset += box_size
         f.seek(offset)
     return boxes
 
@@ -501,7 +542,7 @@ def _collect_stream_payloads(
             continue
         stmp = stmp_boxes[0]
         f.seek(stmp.offset + 8)
-        stmp_us = _from_bytes(f.read(stmp.struct_size * stmp.repeat))
+        stmp_us = _from_bytes(_read(f, stmp.struct_size * stmp.repeat, "STMP timestamp"))
         stmp_ms = stmp_us / 1000
 
         scale_divisor: ScaleDivisor = 1.0
@@ -509,10 +550,14 @@ def _collect_stream_payloads(
             scal_boxes = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", "SCAL"])
             if scal_boxes:
                 scal = scal_boxes[0]
+                # An empty divisor tuple would make every _divisor_at() lookup
+                # index out of range; a SCAL with no divisors carries no scale.
+                if scal.repeat == 0:
+                    raise ValueError(f"GPMF SCAL at offset {scal.offset} has repeat == 0.")
                 f.seek(scal.offset + 8)
                 if scal.struct_size in (2, 4):
                     scale_divisor = tuple(
-                        _from_bytes(f.read(scal.struct_size), signed=True)
+                        _from_bytes(_read(f, scal.struct_size, "SCAL divisor"), signed=True)
                         for _ in range(scal.repeat)
                     )
 
@@ -521,7 +566,7 @@ def _collect_stream_payloads(
             if key_boxes:
                 key_box = key_boxes[0]
                 f.seek(key_box.offset + 8)
-                sticky_values[key] = _from_bytes(f.read(key_box.struct_size))
+                sticky_values[key] = _from_bytes(_read(f, key_box.struct_size, key))
 
         stream_box = get_gpmf_boxes(f, strm.offset, strm.size, ["STRM", stream_key])[0]
 
@@ -606,7 +651,7 @@ def _decode_stream_values(
                 stnm = stnm_boxes[0]
                 f.seek(stnm.offset + 8)
                 name = (
-                    f.read(stnm.struct_size * stnm.repeat)
+                    _read(f, stnm.struct_size * stnm.repeat, "STNM name")
                     .decode("ascii", errors="replace")
                     .rstrip("\x00")
                 )

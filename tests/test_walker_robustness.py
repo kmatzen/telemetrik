@@ -14,7 +14,7 @@ import pytest
 
 from telemetrik.parser import extract_all_telemetry, get_boxes, get_gpmf_boxes
 
-from .helpers import accl_payload, build_gopro_mp4, devc, stmp, strm
+from .helpers import _raw_klv, accl_payload, build_gopro_mp4, devc, klv, stmp, strm
 
 
 def test_get_boxes_size_zero_extends_to_end_of_search_range():
@@ -74,6 +74,27 @@ def test_get_gpmf_boxes_invalid_key_raises_value_error():
 
     with pytest.raises(ValueError, match="Invalid GPMF KLV key"):
         get_gpmf_boxes(io.BytesIO(data), 0, len(data), ["DEVC"])
+
+
+def test_get_gpmf_boxes_rejects_payload_past_the_box():
+    """Audit finding 2: a KLV whose declared struct_size * repeat runs past the end
+    of the box being walked must be rejected, not walked into the next box."""
+    data = _raw_klv(b"DEVC", 0, 1, 40, bytes(8))  # declares 40 payload bytes, carries 8
+
+    with pytest.raises(ValueError, match="remain in its parent box"):
+        get_gpmf_boxes(io.BytesIO(data), 0, len(data), ["DEVC"])
+
+
+def test_extract_rejects_payload_running_past_the_sample():
+    """The root cause of cross-sample data fabrication: sample 1 declares 300 SHUT
+    readings but carries 10 bytes, so the remaining 290 come from sample 2's header
+    bytes. Extraction must raise instead of inventing readings."""
+    oversized = _raw_klv(b"SHUT", ord("b"), 1, 300, bytes(10))
+    sample1 = devc(strm(stmp(0) + oversized))
+    sample2 = devc(strm(stmp(10_000) + klv(b"SHUT", ord("b"), 1, 300, bytes([7]) * 300)))
+
+    with pytest.raises(ValueError, match="SHUT.*remain in its parent box"):
+        _extract(build_gopro_mp4([sample1, sample2]), streams=["SHUT"])
 
 
 def _extract(mp4_bytes: bytes, streams):

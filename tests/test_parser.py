@@ -398,6 +398,134 @@ def test_float_stream_is_scaled_by_scal():
     assert stream.data[0][1] == (1.0, 2.0, 3.0)
 
 
+# ---------------------------------------------------------------------------
+# Security audit regression tests (lengths declared by the file)
+# ---------------------------------------------------------------------------
+
+
+def test_stsz_uniform_entry_count_bounded_by_file_size():
+    """Audit finding 1: a uniform-size stsz drives ``[sample_size] * num_entries``
+    straight from a 32-bit count. A 1e8 count from a ~100-byte file allocated
+    ~900 MB before the offset/size consistency check ran."""
+    from .helpers import _mdhd, _stco
+
+    gmhd = mp4_box(b"gmhd", mp4_box(b"gpmd", b""))
+    stsz = mp4_box(b"stsz", bytes(4) + (8).to_bytes(4, "big") + (10**8).to_bytes(4, "big"))
+    moov = mp4_box(
+        b"moov",
+        mp4_box(
+            b"trak",
+            mp4_box(
+                b"mdia",
+                _mdhd(1_000_000) + mp4_box(b"minf", gmhd + mp4_box(b"stbl", stsz + _stco([0]))),
+            ),
+        ),
+    )
+    fn = _tmp_path(moov)
+    try:
+        with pytest.raises(ValueError, match="stsz declares 100000000 samples"):
+            extract_all_telemetry(fn, streams=["ACCL"])
+    finally:
+        os.unlink(fn)
+
+
+@pytest.mark.parametrize("key", ["stsz", "stco", "co64", "stsc"])
+def test_sample_table_entry_count_bounded_by_its_box(key: str):
+    """Audit finding 1 (same shape in stsz/stco/co64/stsc): the entry count must be
+    checked against the bytes its own box offers (4, 4, 8 and 12 bytes per entry,
+    respectively) before it drives a loop."""
+    from .helpers import _mdhd, _stco, _stsz
+
+    # stsz carries a sample_size field before the count; the others don't.
+    forged = mp4_box(
+        key.encode(), bytes(8 if key == "stsz" else 4) + (0xFFFFFFFF).to_bytes(4, "big")
+    )
+    stsz = forged if key == "stsz" else _stsz([48])
+    chunk_offsets = _stco([0]) if key in ("stsz", "stsc") else forged
+    stbl = mp4_box(b"stbl", stsz + chunk_offsets + (forged if key == "stsc" else b""))
+    gmhd = mp4_box(b"gmhd", mp4_box(b"gpmd", b""))
+    moov = mp4_box(
+        b"moov",
+        mp4_box(b"trak", mp4_box(b"mdia", _mdhd(1_000_000) + mp4_box(b"minf", gmhd + stbl))),
+    )
+
+    fn = _tmp_path(moov)
+    try:
+        with pytest.raises(ValueError, match=rf"{key} entry count declares 4294967295 entries"):
+            extract_all_telemetry(fn, streams=["ACCL"])
+    finally:
+        os.unlink(fn)
+
+
+def test_truncated_stmp_payload_raises_value_error():
+    """Audit finding 4: the STMP value was read with a bare ``f.read()``, so a
+    missing timestamp payload silently dropped a reading instead of raising."""
+    accl = accl_payload([(1, 2, 3)])
+    body = accl + stmp(0)  # STMP last, so its payload is the tail of the sample
+    payload = devc(strm(body))
+    # Keep the STMP header (at 8+8+len(accl)) but only 3 of its 8 payload bytes.
+    truncated = payload[: 16 + len(accl) + 8 + 3]
+    f = io.BytesIO(truncated)
+
+    with pytest.raises(ValueError, match="STMP timestamp"):
+        get_stream_data(f, [Sample(0, len(payload))], "ACCL")
+
+
+def test_truncated_scal_payload_raises_value_error():
+    """Audit finding 4: SCAL divisors were read with a bare ``f.read()``, so a
+    truncated divisor table scaled by whatever bytes followed."""
+    accl = accl_payload([(1000, 1000, 1000)])
+    stmp_bytes = stmp(0)
+    scal_bytes = scal([1000, 1000])
+    body = accl + stmp_bytes + scal_bytes  # SCAL last, so its table is the tail
+    payload = devc(strm(body))
+    # Keep the SCAL header (2 box headers + accl + stmp) and 2 of its 8 payload bytes.
+    truncated = payload[: 16 + len(accl) + len(stmp_bytes) + 8 + 2]
+    f = io.BytesIO(truncated)
+
+    with pytest.raises(ValueError, match="SCAL divisor"):
+        get_stream_data(f, [Sample(0, len(payload))], "ACCL")
+
+
+def test_scal_repeat_zero_raises_value_error():
+    """Audit finding 5: an empty divisor tuple made ``_divisor_at`` compute
+    ``min(0, -1)`` and escape as IndexError; the API documents ValueError."""
+    body = stmp(0) + scal([]) + accl_payload([(100, 200, 300)])
+    payload = devc(strm(body))
+    f = io.BytesIO(payload)
+
+    with pytest.raises(ValueError, match="SCAL at offset .* has repeat == 0"):
+        get_stream_data(f, [Sample(0, len(payload))], "ACCL")
+
+
+def test_uniform_size_stsz_is_still_accepted():
+    """The stsz guard must not reject the legal uniform-size form (no per-sample
+    table), as long as the sample count fits the file."""
+    from .helpers import _mdhd, _stco
+
+    p1 = devc(strm(stmp(0) + accl_payload([(1, 2, 3)])))
+    gmhd = mp4_box(b"gmhd", mp4_box(b"gpmd", b""))
+    # Uniform form: sample_size != 0 and no per-sample table follows.
+    stsz = mp4_box(b"stsz", bytes(4) + (len(p1)).to_bytes(4, "big") + (1).to_bytes(4, "big"))
+
+    def build(offset: int) -> bytes:
+        stbl = mp4_box(b"stbl", stsz + _stco([offset]))
+        return mp4_box(
+            b"moov",
+            mp4_box(b"trak", mp4_box(b"mdia", _mdhd(1_000_000) + mp4_box(b"minf", gmhd + stbl))),
+        )
+
+    moov = build(0)
+    moov = build(len(moov))
+    fn = _tmp_path(moov + p1)
+    try:
+        telemetry = extract_all_telemetry(fn, streams=["ACCL"])
+    finally:
+        os.unlink(fn)
+
+    assert [v for _, v in telemetry["ACCL"].data] == [(1.0, 2.0, 3.0)]
+
+
 def _tmp_path(data: bytes) -> str:
     import tempfile
 
