@@ -10,7 +10,7 @@ API, and additional stream support.
 
 import os
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from os.path import getsize
 from typing import Any, BinaryIO, Callable, Optional, Union
 
@@ -84,14 +84,6 @@ def get_boxes(f: BinaryIO, offset: int, size: int, box_path: list[str]) -> list[
     return boxes
 
 
-def _file_size(f: BinaryIO) -> int:
-    """Total size of *f*; restores the cursor."""
-    position = f.tell()
-    size = f.seek(0, os.SEEK_END)
-    f.seek(position)
-    return size
-
-
 def _entry_count(f: BinaryIO, box: Box, context: str, entry_size: int) -> int:
     """Read a full-box entry count at the cursor, bounded by the box's own size.
 
@@ -144,7 +136,7 @@ def get_samples(f: BinaryIO, stbl: Box) -> list[Sample]:
         # any content is validated. See the README's 270x note; `max_readings`
         # cannot help, because the sample table is built before it is consulted.
         num_entries = _from_bytes(_read(f, 4, "stsz entry count"))
-        file_size = _file_size(f)
+        file_size = f.seek(0, os.SEEK_END)
         if num_entries > file_size:
             raise ValueError(
                 f"stsz declares {num_entries} samples but the file holds {file_size} bytes."
@@ -528,19 +520,29 @@ class TelemetryStream:
 # ---------------------------------------------------------------------------
 
 
-#: One matched STRM payload: the stream's own box, the SCAL divisor(s) in
-#: effect, and the current value of each requested "sticky" metadata box
-#: (e.g. GPS5's GPSF/GPSP), in the order requested.
-_PayloadInfo = tuple[GPMFBox, ScaleDivisor, tuple[int, ...]]
+@dataclass()
+class _PayloadInfo:
+    """One matched STRM payload: its box, the SCAL divisor(s) in effect, the current
+    value of each requested sticky box (GPS5's GPSF/GPSP, in request order), and the
+    sample's STMP/PTS timing.
+
+    The timestamps ride *with* their payload: in parallel lockstep lists, one stray
+    ``continue`` above a single append silently shifts every later timestamp of that
+    stream, with nothing to catch it.
+    """
+
+    stream_box: GPMFBox
+    scale_divisor: ScaleDivisor
+    sticky: tuple[int, ...]  # one value per requested sticky key
+    stmp_ms: float
+    pts: int
 
 
 @dataclass()
 class _StreamCollection:
     """Everything one pass over the samples gathered for a single stream key."""
 
-    stmp_timestamps: list[float]
-    sample_pts_list: list[int]
-    payload_info: list[_PayloadInfo]
+    payloads: list[_PayloadInfo] = field(default_factory=list)
     #: Decoded STNM / SIUN strings of the first payload that carried a real one.
     name: Optional[str] = None
     units: Optional[str] = None
@@ -616,15 +618,18 @@ def _collect_all_stream_payloads(
     metadata boxes, STNM and SIUN are then read from the captured children
     instead of re-walking the subtree per stream.
 
+    The walk is anchored on bytes that exist, not on the lengths the file
+    declares for itself (see the clamp inside the loop).
+
     *sticky_keys_map* maps a stream key to a list of ``(fourcc, default)``
     pairs for metadata boxes that persist across samples once first seen
     (GPS5's GPSF/GPSP); their current values are carried forward per stream
     from the closest earlier sample that had them.
     """
     sticky_keys_map = sticky_keys_map or {}
-    collections = {key: _StreamCollection([], [], []) for key in dict.fromkeys(stream_keys)}
+    collections = {key: _StreamCollection() for key in dict.fromkeys(stream_keys)}
     sticky_values = {key: dict(sticky_keys) for key, sticky_keys in sticky_keys_map.items()}
-    file_size = _file_size(f)
+    file_size = f.seek(0, os.SEEK_END)
 
     for index, sample in enumerate(samples):
         # Every length that anchors the walk below — the sample's own stsz size and
@@ -683,6 +688,7 @@ def _collect_all_stream_payloads(
                         for _ in range(scal_box.repeat)
                     )
 
+            pts = sample.pts if sample.pts is not None else 0
             for key in keys_here:
                 col = collections[key]
                 sticky_state = sticky_values.get(key)
@@ -698,15 +704,15 @@ def _collect_all_stream_payloads(
                     col.name = _decode_name(f, first_child.get("STNM"))
                 if col.units is None:
                     col.units = _decode_units(f, first_child.get("SIUN"))
-                col.stmp_timestamps.append(stmp_ms)
-                col.sample_pts_list.append(sample.pts if sample.pts is not None else 0)
-                col.payload_info.append(
-                    (
+                col.payloads.append(
+                    _PayloadInfo(
                         first_child[key],
                         scale_divisor,
                         tuple(sticky_state[k] for k, _ in sticky_keys_map[key])
                         if sticky_state is not None
                         else (),
+                        stmp_ms,
+                        pts,
                     )
                 )
 
@@ -719,10 +725,10 @@ def _decode_stream_values(
     time_base: Optional[tuple[int, int]],
     transform: Optional[Callable[[Any, tuple[int, ...]], Optional[Any]]] = None,
     max_readings: Optional[int] = None,
-) -> tuple[list[tuple[float, Any]], list[tuple[float, Any]], int, str, str]:
+) -> tuple[list[tuple[float, Any]], list[tuple[float, Any]], int]:
     """
-    Decode each payload's raw values with interpolated STMP/PTS timestamps, and
-    report the stream's name (STNM) and units (SIUN) gathered during collection.
+    Decode each payload's raw values with interpolated STMP/PTS timestamps. The
+    stream's name (STNM) and units (SIUN) ride on *col*, decoded during collection.
 
     *transform* post-processes each raw decoded value together with that
     payload's sticky metadata tuple; returning ``None`` skips the reading
@@ -743,24 +749,24 @@ def _decode_stream_values(
     reading_duration_ms = 0.0
     reading_duration_pts = 0.0
 
-    stmp_timestamps = col.stmp_timestamps
-
-    for payload_idx, (stream_box, scale_divisor, sticky) in enumerate(col.payload_info):
+    payloads = col.payloads
+    for payload_idx, info in enumerate(payloads):
+        stream_box = info.stream_box
         f.seek(stream_box.offset + 8)
 
-        base_timestamp_ms = stmp_timestamps[payload_idx]
-        base_pts = col.sample_pts_list[payload_idx]
+        base_timestamp_ms = info.stmp_ms
+        base_pts = info.pts
 
         # A payload with repeat == 0 carries no readings; skipping it avoids a
         # division by zero when interpolating timestamps.
         if stream_box.repeat > 0:
-            if payload_idx + 1 < len(stmp_timestamps):
-                next_stmp_ms = stmp_timestamps[payload_idx + 1]
+            if payload_idx + 1 < len(payloads):
+                next_stmp_ms = payloads[payload_idx + 1].stmp_ms
                 delta_stmp_ms = next_stmp_ms - base_timestamp_ms
                 reading_duration_ms = delta_stmp_ms / stream_box.repeat
 
                 if time_base is not None:
-                    next_pts = col.sample_pts_list[payload_idx + 1]
+                    next_pts = payloads[payload_idx + 1].pts
                     delta_pts = next_pts - base_pts
                     reading_duration_pts = delta_pts / stream_box.repeat
 
@@ -768,9 +774,13 @@ def _decode_stream_values(
                 timestamp_ms = base_timestamp_ms + (i * reading_duration_ms)
 
                 raw_value = _parse_gpmf_value(
-                    f, stream_box.type, stream_box.struct_size, stream_box.repeat, scale_divisor
+                    f,
+                    stream_box.type,
+                    stream_box.struct_size,
+                    stream_box.repeat,
+                    info.scale_divisor,
                 )
-                value = transform(raw_value, sticky) if transform is not None else raw_value
+                value = transform(raw_value, info.sticky) if transform is not None else raw_value
                 if value is None:
                     continue
                 data.append((timestamp_ms, value))
@@ -787,9 +797,34 @@ def _decode_stream_values(
                         f"({sample_count} readings so far)."
                     )
 
-    # Name and units were decoded during collection, where the first payload
-    # carrying a real (non-padding) value won.
-    return data, pts_data, sample_count, col.name or "", col.units or ""
+    return data, pts_data, sample_count
+
+
+def _stream_from_collection(
+    f: BinaryIO,
+    stream_key: str,
+    col: _StreamCollection,
+    time_base: Optional[tuple[int, int]],
+    max_readings: Optional[int] = None,
+    transform: Optional[Callable[[Any, tuple[int, ...]], Optional[Any]]] = None,
+) -> TelemetryStream:
+    """The single place a :class:`TelemetryStream` is assembled, for every key. GPS5
+    is the one key with a per-reading *transform* (it carries its sticky fix/precision
+    along, dropping incomplete tuples) and with defaults for name and units.
+    """
+    data, pts_data, sample_count = _decode_stream_values(
+        f, col, time_base, transform=transform, max_readings=max_readings
+    )
+    name = col.name or ""
+    units = col.units or ""
+    if stream_key == "GPS5":
+        # GPS5's 7 channels: lat, lon, alt, speed_2d, speed_3d, plus the sticky fix/dop.
+        name = name or "GPS (Latitude, Longitude, Altitude)"
+        units = units + ",fix,dop" if units else "deg,deg,m,m/s,m/s,fix,dop"
+
+    return TelemetryStream(
+        stream_key, sample_count, name, units, data, pts_data=pts_data if pts_data else None
+    )
 
 
 def get_stream_data(
@@ -814,11 +849,7 @@ def get_stream_data(
         timestamps.
     """
     col = _collect_all_stream_payloads(f, samples, [stream_key], scale)[stream_key]
-    data, pts_data, sample_count, name, units = _decode_stream_values(f, col, time_base)
-
-    return TelemetryStream(
-        stream_key, sample_count, name, units, data, pts_data=pts_data if pts_data else None
-    )
+    return _stream_from_collection(f, stream_key, col, time_base)
 
 
 def _extend_with_gps_quality(raw_value: Any, sticky: tuple[int, ...]) -> Optional[Any]:
@@ -826,36 +857,6 @@ def _extend_with_gps_quality(raw_value: Any, sticky: tuple[int, ...]) -> Optiona
     if isinstance(raw_value, tuple) and len(raw_value) == 5:
         return raw_value + sticky
     return None
-
-
-def _decode_gps_stream(
-    f: BinaryIO,
-    col: _StreamCollection,
-    time_base: Optional[tuple[int, int]],
-    max_readings: Optional[int] = None,
-) -> TelemetryStream:
-    data, pts_data, sample_count, name, units = _decode_stream_values(
-        f, col, time_base, transform=_extend_with_gps_quality, max_readings=max_readings
-    )
-
-    return TelemetryStream(
-        key="GPS5",
-        sample_count=sample_count,
-        name=name if name else "GPS (Latitude, Longitude, Altitude)",
-        units=units + ",fix,dop" if units else "deg,deg,m,m/s,m/s,fix,dop",
-        data=data,
-        pts_data=pts_data if pts_data else None,
-    )
-
-
-def _get_gps_data_with_sticky_metadata(
-    f: BinaryIO, samples: list[Sample], time_base: Optional[tuple[int, int]] = None
-) -> TelemetryStream:
-    """Extract GPS5 with sticky GPSF (fix type) and GPSP (precision) metadata."""
-    col = _collect_all_stream_payloads(
-        f, samples, ["GPS5"], scale=True, sticky_keys_map={"GPS5": _GPS5_STICKY_KEYS}
-    )["GPS5"]
-    return _decode_gps_stream(f, col, time_base)
 
 
 # ---------------------------------------------------------------------------
@@ -893,8 +894,8 @@ def extract_all_telemetry(
             across all streams. Extraction of a metadata track costs roughly
             two orders of magnitude more RAM than the file's size (see the
             README), so a cap bounds the damage from oversized or hostile
-            tracks. It is enforced inside the decode loop, so it bounds the
-            peak memory of the decode and not only the returned dict.
+            tracks. The cap is enforced inside the decode loop, so it bounds
+            the peak memory of the decode and not just the returned dict.
             ``None`` (default) means unlimited.
 
     Returns:
@@ -906,8 +907,8 @@ def extract_all_telemetry(
             if the extraction exceeds *max_readings*.
     """
     # Normalised once: the collection pass and the decode loop below both
-    # iterate it, so a one-shot iterator (a generator) must not be consumed by
-    # the first pass and leave the second with nothing to do.
+    # iterate it, so a one-shot iterator (a generator) must not be consumed
+    # by the first pass and silently yield nothing to the second.
     streams = list(DEFAULT_STREAMS if streams is None else streams)
 
     telemetry_streams = {}
@@ -965,34 +966,24 @@ def extract_all_telemetry(
         total_readings = 0
         for stream_key in streams:
             col = collections[stream_key]
-            # Hand the allowance left over from max_readings to the decode loop,
-            # so the cap stops the decode (and its allocations) and not just its
-            # result.
+            # Hand the remaining allowance to the decode loop, so the cap stops
+            # the decode (and its allocations) instead of just its result.
             allowance = None if max_readings is None else max_readings - total_readings
-            if stream_key == "GPS5":
-                stream = _decode_gps_stream(f, col, time_base, max_readings=allowance)
-            else:
-                data, pts_data, sample_count, name, units = _decode_stream_values(
-                    f, col, time_base, max_readings=allowance
-                )
-                stream = TelemetryStream(
-                    stream_key,
-                    sample_count,
-                    name,
-                    units,
-                    data,
-                    pts_data=pts_data if pts_data else None,
-                )
+            transform = _extend_with_gps_quality if stream_key == "GPS5" else None
+            stream = _stream_from_collection(
+                f, stream_key, col, time_base, max_readings=allowance, transform=transform
+            )
+            if stream.sample_count == 0:
+                continue
 
-            if stream.sample_count > 0:
-                total_readings += stream.sample_count
-                # Each stream may run one reading over its own allowance, so this
-                # after-the-fact check is what bounds the *total across streams*.
-                if max_readings is not None and total_readings > max_readings:
-                    raise ValueError(
-                        f"Telemetry extraction exceeds max_readings={max_readings} "
-                        f"({total_readings} readings so far)."
-                    )
-                telemetry_streams[stream_key] = stream
+            total_readings += stream.sample_count
+            # Each stream may run one reading over its own allowance, so this
+            # after-the-fact check is what bounds the *total across streams*.
+            if max_readings is not None and total_readings > max_readings:
+                raise ValueError(
+                    f"Telemetry extraction exceeds max_readings={max_readings} "
+                    f"({total_readings} readings so far)."
+                )
+            telemetry_streams[stream_key] = stream
 
     return telemetry_streams

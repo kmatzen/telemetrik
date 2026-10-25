@@ -11,7 +11,6 @@ import pytest
 
 from telemetrik.parser import (
     Sample,
-    _get_gps_data_with_sticky_metadata,
     extract_all_telemetry,
     get_stream_data,
 )
@@ -42,10 +41,8 @@ def test_gps5_multi_value_scal_scales_each_channel_independently():
         + scal([10_000_000, 10_000_000, 1_000, 1_000, 100])
         + gps5_payload([(377749000, -1224194000, 15300, 500, 510)])
     )
-    payload = devc(strm(body))
-    f = io.BytesIO(payload)
 
-    stream = _get_gps_data_with_sticky_metadata(f, [Sample(0, len(payload))])
+    stream = _extract(build_gopro_mp4([devc(strm(body))]), streams=["GPS5"])["GPS5"]
 
     assert stream.sample_count == 1
     _, (lat, lon, alt, speed_2d, speed_3d, fix, dop) = stream.data[0]
@@ -87,10 +84,8 @@ def test_single_payload_gps_stream_does_not_crash():
         + scal([10_000_000, 10_000_000, 1000, 1000, 100])
         + gps5_payload([(377749000, -1224194000, 15300, 500, 510)])
     )
-    payload = devc(strm(body))
-    f = io.BytesIO(payload)
 
-    stream = _get_gps_data_with_sticky_metadata(f, [Sample(0, len(payload))])
+    stream = _extract(build_gopro_mp4([devc(strm(body))]), streams=["GPS5"])["GPS5"]
 
     assert stream.sample_count == 1
 
@@ -126,10 +121,8 @@ def test_gps5_sticky_gpsf_gpsp_persist_across_samples():
     )
     payload1 = devc(strm(body1))
     payload2 = devc(strm(body2))
-    f = io.BytesIO(payload1 + payload2)
-    samples = [Sample(0, len(payload1)), Sample(len(payload1), len(payload2))]
 
-    stream = _get_gps_data_with_sticky_metadata(f, samples)
+    stream = _extract(build_gopro_mp4([payload1, payload2]), streams=["GPS5"])["GPS5"]
 
     assert stream.sample_count == 2
     fix1, dop1 = stream.data[0][1][5], stream.data[0][1][6]
@@ -205,10 +198,8 @@ def test_gps5_units_are_retried_independently_of_name():
     )
     payload1 = devc(strm(body1))
     payload2 = devc(strm(body2))
-    f = io.BytesIO(payload1 + payload2)
-    samples = [Sample(0, len(payload1)), Sample(len(payload1), len(payload2))]
 
-    stream = _get_gps_data_with_sticky_metadata(f, samples)
+    stream = _extract(build_gopro_mp4([payload1, payload2]), streams=["GPS5"])["GPS5"]
 
     assert stream.name == "GPS (Latitude, Longitude, Altitude)"
     assert stream.units == "m,m,m,m/s,m/s,fix,dop"
