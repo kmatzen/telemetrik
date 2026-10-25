@@ -85,17 +85,29 @@ Filter on `fix >= 3` and `dop < 500` for reliable positions.
 
 ## API reference
 
-### `extract_all_telemetry(video_path, streams=None)`
+### `extract_all_telemetry(video_path, streams=None, max_readings=None)`
 
 Extract all (or selected) telemetry streams from an MP4 file.
 
 **Parameters:**
 - `video_path` — path to a GoPro MP4 file
 - `streams` — list of FourCC strings, or `None` for all default streams
+- `max_readings` — optional cap on the total readings extracted across all
+  streams; `None` (default) means unlimited
 
 **Returns:** `dict[str, TelemetryStream]` — only streams with data are included.
 
-**Raises:** `ValueError` if the file has no GPMF metadata track.
+**Raises:** `ValueError` if the file has no GPMF metadata track, or if the
+extraction exceeds `max_readings`.
+
+**Memory cost:** the result is built entirely in RAM, as one Python tuple per
+reading. Measured on a synthetic metadata track, a 8.0 MB GPMF track peaks at
+≈2.1 GiB resident memory while extracting one of its streams — roughly 270
+bytes of RAM per byte of file (about 270×), and the CSV export amplifies the
+same way on disk (a 0.20 MB metadata track renders ≈2.1 MB of CSV, ≈10×).
+Parsing a hostile or unexpectedly huge metadata track can therefore cost far
+more memory than the file's size; pass `max_readings` to put a hard,
+catchable bound on it.
 
 ### `TelemetryStream`
 
