@@ -1,7 +1,6 @@
 """Command-line interface for extracting GPMF telemetry to CSV."""
 
 import argparse
-import contextlib
 import csv
 import json
 import os
@@ -66,7 +65,6 @@ def _row_values(value: Any) -> list[str]:
     return [_escape_cell(value)]
 
 
-@contextlib.contextmanager
 def _open_output(path: Path, force: bool):
     """Open *path* for writing without a check-then-write race.
 
@@ -74,17 +72,21 @@ def _open_output(path: Path, force: bool):
     symlink) fails atomically with FileExistsError. Force: truncate via
     O_NOFOLLOW so a symlink is never written through. O_NOFOLLOW is absent on
     Windows, hence the getattr fallback.
+
+    The returned file object is the context manager; the caller's ``with``
+    closes it and propagates write errors.
     """
     if force:
         fd = os.open(
             path,
             os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
         )
-        with os.fdopen(fd, "w", newline="") as f:
-            yield f
-    else:
-        with open(path, "x", newline="") as f:
-            yield f
+        return os.fdopen(fd, "w", newline="")
+    try:
+        return open(path, "x", newline="")
+    except FileExistsError as e:
+        # The only place a user learns --force exists; keep the hint explicit.
+        raise FileExistsError(f"{path} already exists (use --force to overwrite)") from e
 
 
 def save_stream_to_file(
@@ -96,7 +98,8 @@ def save_stream_to_file(
     """Save a telemetry stream to a CSV file next to the source video (or *output_dir*).
 
     Raises:
-        FileExistsError: If the output file already exists and *force* is False.
+        FileExistsError: If the output file already exists and *force* is False
+            (the message points at ``--force``).
         OSError: If the output path is a symlink (never followed/written through).
     """
     suffix = stream.key.lower()
@@ -141,6 +144,14 @@ def main() -> None:
         action="store_true",
         help="Overwrite existing output files instead of skipping them",
     )
+    parser.add_argument(
+        "--max-readings",
+        type=int,
+        default=None,
+        help="Cap total readings extracted per file (default: unlimited). "
+        "Extraction costs far more RAM than the file's size, so a cap bounds "
+        "the damage from oversized or hostile files",
+    )
 
     args = parser.parse_args()
 
@@ -168,7 +179,9 @@ def main() -> None:
 
         print(f"{video_path}:")
         try:
-            telemetry = extract_all_telemetry(str(video_path), streams=streams)
+            telemetry = extract_all_telemetry(
+                str(video_path), streams=streams, max_readings=args.max_readings
+            )
         except (ValueError, IndexError, OSError) as e:
             print(f"  Error: {e}", file=sys.stderr)
             had_failure = True
@@ -181,9 +194,6 @@ def main() -> None:
         for stream in telemetry.values():
             try:
                 save_stream_to_file(stream, video_path, output_dir, args.force)
-            except FileExistsError as e:
-                print(f"  Error: {e}", file=sys.stderr)
-                had_failure = True
             except OSError as e:
                 print(f"  Error: {e}", file=sys.stderr)
                 had_failure = True
