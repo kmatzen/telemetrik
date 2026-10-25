@@ -6,10 +6,13 @@ had no header and didn't use the csv module.
 """
 
 import csv
+import os
 import sys
+from pathlib import Path
 
 import pytest
 
+from telemetrik import cli
 from telemetrik.cli import main, save_stream_to_file
 from telemetrik.parser import TelemetryStream
 
@@ -68,6 +71,41 @@ def test_save_stream_to_file_uses_output_dir(tmp_path):
     assert output_path.exists()
 
 
+def test_save_stream_to_file_escapes_csv_formula_injection(tmp_path):
+    """A string value starting with '=' must not become a live spreadsheet formula."""
+    stream = _make_stream(key="TXTA", data=[(0, "=cmd|'/c calc'!A0"), (1, "+EVIL"), (2, "@x")])
+    video_path = tmp_path / "GX010042.MP4"
+    video_path.touch()
+
+    output_path = save_stream_to_file(stream, video_path)
+
+    with open(output_path, newline="") as f:
+        rows = list(csv.reader(f))
+    assert rows[1] == ["0", "'=cmd|'/c calc'!A0"]
+    assert rows[2] == ["1", "'+EVIL"]
+    assert rows[3] == ["2", "'@x"]
+
+
+def test_save_stream_to_file_keeps_negative_numbers_unescaped(tmp_path):
+    """str(-117.3) starts with '-' but is a number, not a formula; it must stay intact."""
+    stream = _make_stream(
+        key="GPS5",
+        data=[
+            (0, (-117.3, 33.4, 100.0, -5.5, 1.0, 3, 0.9)),
+            (1, (37.0, -122.0, 0.0, 0.0, 0.0, 0, 0.0)),
+        ],
+    )
+    video_path = tmp_path / "GX010042.MP4"
+    video_path.touch()
+
+    output_path = save_stream_to_file(stream, video_path)
+
+    with open(output_path, newline="") as f:
+        rows = list(csv.reader(f))
+    assert rows[1] == ["0", "-117.3", "33.4", "100.0", "-5.5", "1.0", "3", "0.9"]
+    assert rows[2] == ["1", "37.0", "-122.0", "0.0", "0.0", "0.0", "0", "0.0"]
+
+
 def test_save_stream_to_file_refuses_to_overwrite_without_force(tmp_path):
     stream = _make_stream()
     video_path = tmp_path / "GX010042.MP4"
@@ -91,6 +129,40 @@ def test_save_stream_to_file_overwrites_with_force(tmp_path):
     save_stream_to_file(stream, video_path, force=True)
 
     assert "existing content" not in existing.read_text()
+
+
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="POSIX-only symlink semantics")
+def test_save_stream_to_file_with_force_does_not_follow_symlink(tmp_path):
+    """A symlink planted at the output path must not be written through (check-then-write race)."""
+    stream = _make_stream()
+    video_path = tmp_path / "GX010042.MP4"
+    video_path.touch()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("DO NOT TOUCH")
+    link = tmp_path / "GX010042.accl"
+    link.symlink_to(secret)
+
+    with pytest.raises(OSError):
+        save_stream_to_file(stream, video_path, force=True)
+
+    assert secret.read_text() == "DO NOT TOUCH"
+    assert link.is_symlink()
+
+
+def test_save_stream_to_file_without_force_does_not_follow_symlink(tmp_path):
+    """Exclusive create must refuse a symlinked output path instead of writing through it."""
+    stream = _make_stream()
+    video_path = tmp_path / "GX010042.MP4"
+    video_path.touch()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("DO NOT TOUCH")
+    link = tmp_path / "GX010042.accl"
+    link.symlink_to(secret)
+
+    with pytest.raises(FileExistsError):
+        save_stream_to_file(stream, video_path)
+
+    assert secret.read_text() == "DO NOT TOUCH"
 
 
 def test_save_stream_to_file_uses_pts_seconds_converted_to_ms(tmp_path):
@@ -181,6 +253,42 @@ def test_main_does_not_crash_when_video_path_is_a_directory(tmp_path, monkeypatc
 
     assert exc_info.value.code == 1
     assert "Error" in capsys.readouterr().err
+
+
+def test_main_reports_uncreatable_output_dir_without_traceback(tmp_path, monkeypatch, capsys):
+    """An uncreatable --output-dir must print 'Error: …' and exit non-zero, not raise."""
+    readonly_parent = tmp_path / "ro"
+    readonly_parent.mkdir()
+    readonly_parent.chmod(0o555)
+    try:
+        video_path = tmp_path / "GX010042.MP4"
+        video_path.touch()
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "telemetrik",
+                str(video_path),
+                "--output-dir",
+                str(readonly_parent / "nested" / "deeper"),
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main()  # must not raise PermissionError/OSError
+
+        assert exc_info.value.code == 1
+        assert "Error" in capsys.readouterr().err
+    finally:
+        readonly_parent.chmod(0o755)
+
+
+def test_cli_has_no_dead_struct_error_handler():
+    """struct.error/ZeroDivisionError were unreachable (the parser raises ValueError first)."""
+    assert not hasattr(cli, "struct")
+    source = Path(cli.__file__).read_text(encoding="utf-8")
+    assert "struct.error" not in source
+    assert "ZeroDivisionError" not in source
 
 
 def test_main_continues_after_save_failure(tmp_path, monkeypatch, capsys):
