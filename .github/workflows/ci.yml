@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: dev deps come from PyPI via uv.lock, so a compromised
+# dependency must never inherit a repo-writing GITHUB_TOKEN on PRs.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -20,14 +25,17 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install package
-        run: pip install -e . pytest
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install package and dev tools (locked)
+        run: uv sync --frozen --python ${{ matrix.python-version }}
 
       - name: Smoke test
-        run: python -c "from telemetrik import extract_all_telemetry, TelemetryStream, __version__; print(f'telemetrik {__version__} OK')"
+        run: uv run python -c "from telemetrik import extract_all_telemetry, TelemetryStream, __version__; print(f'telemetrik {__version__} OK')"
 
       - name: Test
-        run: python -m pytest
+        run: uv run python -m pytest
 
   lint:
     runs-on: ubuntu-latest
@@ -39,14 +47,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install package and tools
-        run: pip install -e . ruff mypy
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install package and dev tools (locked)
+        run: uv sync --frozen
 
       - name: Ruff check
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: Ruff format check
-        run: ruff format --check .
+        run: uv run ruff format --check .
 
       - name: Mypy
-        run: mypy src/telemetrik
+        run: uv run mypy src/telemetrik

@@ -4,8 +4,11 @@ on:
   release:
     types: [published]
 
+# Workflow-level permissions replace all defaults, so declare contents:read
+# explicitly: the build job's actions/checkout needs it. id-token stays
+# job-scoped (trusted publishing); no long-lived token is used.
 permissions:
-  id-token: write
+  contents: read
 
 jobs:
   build:
@@ -34,6 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
+      contents: read
       id-token: write
     steps:
       - name: Download artifact
