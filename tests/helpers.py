@@ -14,6 +14,18 @@ def klv(
 ) -> bytes:
     """Build a single GPMF KLV element (32-bit aligned)."""
     assert len(payload) == struct_size * repeat, "payload length must equal struct_size * repeat"
+    return _raw_klv(key, type_char, struct_size, repeat, payload)
+
+
+def _raw_klv(
+    key: bytes, type_char: Optional[int], struct_size: int, repeat: int, payload: bytes
+) -> bytes:
+    """Build a KLV element whose declared size need not match *payload*.
+
+    The malformed sibling of :func:`klv`: it writes the header a hostile file
+    would carry (a payload longer than the bytes actually present), leaving the
+    rest of the element to be read out of whatever follows it.
+    """
     type_byte = type_char if type_char is not None else 0
     header = key + bytes([type_byte, struct_size]) + repeat.to_bytes(2, "big")
     pad = (-len(payload)) % 4
