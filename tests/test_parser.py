@@ -533,3 +533,22 @@ def _tmp_path(data: bytes) -> str:
     with os.fdopen(fd, "wb") as f:
         f.write(data)
     return path
+
+
+def test_max_readings_caps_total_extraction():
+    """max_readings bounds the total readings extracted: at the cap the
+    extraction succeeds, one reading over raises ValueError, and the default
+    (None) leaves extraction unlimited."""
+    samples = [
+        devc(strm(stmp(i * 1000) + accl_payload([(1, 2, 3), (4, 5, 6)]))) for i in range(5)
+    ]  # 5 samples x 2 readings = 10 readings
+    fn = _tmp_path(build_gopro_mp4(samples))
+    try:
+        assert extract_all_telemetry(fn, streams=["ACCL"])["ACCL"].sample_count == 10
+        assert (
+            extract_all_telemetry(fn, streams=["ACCL"], max_readings=10)["ACCL"].sample_count == 10
+        )
+        with pytest.raises(ValueError, match="max_readings"):
+            extract_all_telemetry(fn, streams=["ACCL"], max_readings=9)
+    finally:
+        os.unlink(fn)
