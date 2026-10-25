@@ -17,6 +17,7 @@ from telemetrik.parser import (
 )
 
 from .helpers import (
+    _raw_klv,
     accl_payload,
     build_gopro_mp4,
     devc,
@@ -459,7 +460,13 @@ def test_sample_table_entry_count_bounded_by_its_box(key: str):
 
 def test_truncated_stmp_payload_raises_value_error():
     """Audit finding 4: the STMP value was read with a bare ``f.read()``, so a
-    missing timestamp payload silently dropped a reading instead of raising."""
+    missing timestamp payload silently dropped a reading instead of raising.
+
+    With the walk anchored on real bytes (round 2), a payload truncated at the
+    end of the sample is stopped one layer earlier — by the parent-size guard,
+    which is the cheaper and earlier stop — so either message is a pass. Both
+    raise ValueError; the point of the test is that nothing is invented.
+    """
     accl = accl_payload([(1, 2, 3)])
     body = accl + stmp(0)  # STMP last, so its payload is the tail of the sample
     payload = devc(strm(body))
@@ -467,13 +474,17 @@ def test_truncated_stmp_payload_raises_value_error():
     truncated = payload[: 16 + len(accl) + 8 + 3]
     f = io.BytesIO(truncated)
 
-    with pytest.raises(ValueError, match="STMP timestamp"):
+    with pytest.raises(ValueError, match="STMP timestamp|remain in its parent box"):
         get_stream_data(f, [Sample(0, len(payload))], "ACCL")
 
 
 def test_truncated_scal_payload_raises_value_error():
     """Audit finding 4: SCAL divisors were read with a bare ``f.read()``, so a
-    truncated divisor table scaled by whatever bytes followed."""
+    truncated divisor table scaled by whatever bytes followed.
+
+    As with the STMP case, anchoring the walk on real bytes reports the same
+    truncation one layer earlier; both paths raise ValueError.
+    """
     accl = accl_payload([(1000, 1000, 1000)])
     stmp_bytes = stmp(0)
     scal_bytes = scal([1000, 1000])
@@ -483,7 +494,7 @@ def test_truncated_scal_payload_raises_value_error():
     truncated = payload[: 16 + len(accl) + len(stmp_bytes) + 8 + 2]
     f = io.BytesIO(truncated)
 
-    with pytest.raises(ValueError, match="SCAL divisor"):
+    with pytest.raises(ValueError, match="SCAL divisor|remain in its parent box"):
         get_stream_data(f, [Sample(0, len(payload))], "ACCL")
 
 
@@ -533,6 +544,182 @@ def _tmp_path(data: bytes) -> str:
     with os.fdopen(fd, "wb") as f:
         f.write(data)
     return path
+
+
+def _extract(mp4_bytes: bytes, **kwargs):
+    """Write *mp4_bytes* to a temp file and run extract_all_telemetry on it."""
+    fn = _tmp_path(mp4_bytes)
+    try:
+        return extract_all_telemetry(fn, **kwargs)
+    finally:
+        os.unlink(fn)
+
+
+# ---------------------------------------------------------------------------
+# Round-2 audit regression tests (review of the round-1 fixes)
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_stream_key_is_extracted_once():
+    """A repeated key in the request list must not duplicate the readings.
+
+    The collection dict dedupes the request, but the per-sample match list was
+    built from the raw request list, so ``streams=["ACCL", "ACCL"]`` appended
+    every payload twice per STRM: 4164 accelerometer readings on the real sample
+    where the single key gives 2082, silently, and the CSV export wrote every row
+    twice.
+    """
+    samples = [devc(strm(stmp(i * 1000) + accl_payload([(1, 2, 3), (4, 5, 6)]))) for i in range(5)]
+    fn = _tmp_path(build_gopro_mp4(samples))
+    try:
+        single = extract_all_telemetry(fn, streams=["ACCL"])
+        duplicated = extract_all_telemetry(fn, streams=["ACCL", "ACCL"])
+        tripled = extract_all_telemetry(fn, streams=["ACCL", "ACCL", "ACCL"])
+    finally:
+        os.unlink(fn)
+
+    assert single["ACCL"].sample_count == 10
+    assert duplicated["ACCL"].sample_count == 10
+    assert tripled["ACCL"].data == single["ACCL"].data
+
+
+def test_default_streams_plus_a_repeat_extracts_each_stream_once():
+    """``DEFAULT_STREAMS + ["ACCL"]`` (the "make sure ACCL is in there" idiom) must
+    give the same ACCL stream as the plain default list."""
+    from telemetrik.parser import DEFAULT_STREAMS
+
+    body = stmp(0) + stnm("Accelerometer") + siun("m/s^2") + accl_payload([(1, 2, 3)])
+    fn = _tmp_path(build_gopro_mp4([devc(strm(body))]))
+    try:
+        plain = extract_all_telemetry(fn)
+        repeated = extract_all_telemetry(fn, streams=DEFAULT_STREAMS + ["ACCL"])
+    finally:
+        os.unlink(fn)
+
+    assert list(repeated) == list(plain)
+    assert repeated["ACCL"].data == plain["ACCL"].data
+
+
+def test_declared_sample_size_beyond_the_real_bytes_raises():
+    """Audit round 2, finding 2: every length that anchored the walk was declared by
+    the file — the sample's stsz entry, the DEVC/STRM sizes inside it — so a 552-byte
+    file whose sample declares 412 bytes and carries 52 walked straight over its
+    neighbour: SHUT declared 300 readings, carried 10, and the other 289 were read
+    out of the neighbouring sample's 0x07 filler. No error, and main agreed.
+
+    The walk is clamped to bytes that exist (file end, next sample's offset), so the
+    payload that does not fit is now rejected.
+    """
+    from .helpers import _mdhd, _stco, _stsz
+
+    # sample 1: 52 real bytes; SHUT declares 300 uint8 readings, carries 10.
+    shut = _raw_klv(b"SHUT", ord("b"), 1, 300, bytes(range(10)))
+    strm_box = b"STRM" + bytes([0, 4]) + (97).to_bytes(2, "big") + stmp(0) + shut  # 388 declared
+    s1 = b"DEVC" + bytes([0, 4]) + (101).to_bytes(2, "big") + strm_box  # 404 declared
+    s2 = b"\x07" * 288 + b"\x00" * 72  # the filler the readings get lifted from
+    sizes = [412, 0]  # stsz: sample 1 declares 412 bytes, 52 exist
+
+    gmhd = mp4_box(b"gmhd", mp4_box(b"gpmd", b""))
+
+    def build(stbl_payload: bytes) -> bytes:
+        stbl = mp4_box(b"stbl", stbl_payload)
+        return mp4_box(
+            b"moov",
+            mp4_box(b"trak", mp4_box(b"mdia", _mdhd(1_000_000) + mp4_box(b"minf", gmhd + stbl))),
+        )
+
+    moov = build(_stsz(sizes) + _stco([0, 0]))
+    offsets, running = [], len(moov)
+    for sample in (s1, s2):
+        offsets.append(running)
+        running += len(sample)
+    mp4 = build(_stsz(sizes) + _stco(offsets)) + s1 + s2
+    assert len(mp4) == 552 and len(s1) == 52
+
+    with pytest.raises(ValueError, match="remain in its parent box"):
+        _extract(mp4, streams=["SHUT"])
+
+
+def test_empty_stnm_and_siun_do_not_shadow_the_real_name():
+    """A blank STNM/SIUN must not become the stream's name/units.
+
+    Real writers emit a NUL-padded (4-byte aligned) empty STNM for a stream that
+    has no name yet. Latching that first box made name/units come out blank; the
+    name and units of the first payload that carries a real one win, as before.
+    """
+    blank = _raw_klv(b"STNM", ord("c"), 4, 1, b"\x00") + klv(b"SIUN", ord("c"), 0, 0, b"")
+    p1 = devc(strm(stmp(0) + blank + accl_payload([(1, 2, 3)])))
+    p2 = devc(strm(stmp(1000) + stnm("Accelerometer") + siun("m/s^2") + accl_payload([(4, 5, 6)])))
+    f = io.BytesIO(p1 + p2)
+
+    stream = get_stream_data(f, [Sample(0, len(p1)), Sample(len(p1), len(p2))], "ACCL")
+
+    assert stream.name == "Accelerometer"
+    assert stream.units == "m/s^2"
+
+
+def test_generator_streams_matches_list_streams():
+    """``streams`` is used by the collection pass and again by the decode loop, so it
+    must be materialised once: a generator was consumed by the first pass and the
+    extraction returned ``{}`` with no error (the CLI printed "No telemetry found").
+    """
+    body = stmp(0) + accl_payload([(100, 200, 300)])
+    fn = _tmp_path(build_gopro_mp4([devc(strm(body))]))
+    try:
+        from_generator = extract_all_telemetry(fn, streams=(key for key in ["ACCL", "GYRO"]))
+        from_list = extract_all_telemetry(fn, streams=["ACCL", "GYRO"])
+    finally:
+        os.unlink(fn)
+
+    assert set(from_generator) == set(from_list) == {"ACCL"}
+    assert from_generator["ACCL"].data == from_list["ACCL"].data
+
+
+def test_max_readings_bounds_the_decode_not_just_the_result():
+    """The README sells max_readings as the bound on the ~270x RAM amplification, so
+    the cap has to stop the decode. Measured with the check after the stream was
+    decoded: an 8 MB / 8M-reading track with max_readings=100 peaked at 1938 MiB
+    (uncapped: 2081 MiB) — the cap bounded the return value, not the damage.
+    """
+    import tracemalloc
+
+    big = klv(b"SHUT", ord("b"), 1, 8000, bytes(8000))
+    # 150 samples x 8000 readings = 1.2M readings from a 1.2 MB file.
+    mp4 = build_gopro_mp4([devc(strm(stmp(i) + big)) for i in range(150)])
+    fn = _tmp_path(mp4)
+    try:
+        tracemalloc.start()
+        try:
+            with pytest.raises(ValueError, match="max_readings"):
+                extract_all_telemetry(fn, streams=["SHUT"], max_readings=100)
+            peak_bytes = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+    finally:
+        os.unlink(fn)
+
+    # 1.2M readings as tuples is two orders of magnitude more than this; the cap is
+    # what stopped the decode, not just the returned dict.
+    assert peak_bytes < 10 * 1024 * 1024, f"decode peaked at {peak_bytes / 1e6:.1f} MB at cap 100"
+
+
+def test_max_readings_bounds_the_total_across_streams():
+    """Each stream gets the allowance left of *max_readings*, one reading of slack
+    each, so the running total is checked too: 8 + 8 readings across two streams must
+    not return 16 readings under a cap of 12."""
+    gyro = klv(b"GYRO", ord("s"), 6, 8, struct.pack(">24h", *([1] * 24)))
+    samples = [
+        devc(strm(stmp(0) + accl_payload([(1, 2, 3)] * 8))),
+        devc(strm(stmp(1_000_000) + gyro)),
+    ]
+    fn = _tmp_path(build_gopro_mp4(samples))
+    try:
+        assert extract_all_telemetry(fn, streams=["ACCL"], max_readings=8)["ACCL"].sample_count == 8
+        assert len(extract_all_telemetry(fn, streams=["ACCL", "GYRO"], max_readings=16)) == 2
+        with pytest.raises(ValueError, match="max_readings"):
+            extract_all_telemetry(fn, streams=["ACCL", "GYRO"], max_readings=12)
+    finally:
+        os.unlink(fn)
 
 
 def test_max_readings_caps_total_extraction():
