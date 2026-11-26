@@ -13,7 +13,7 @@ Usage::
     accel = streams["ACCL"]
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from telemetrik.parser import (
     DEFAULT_STREAMS,
